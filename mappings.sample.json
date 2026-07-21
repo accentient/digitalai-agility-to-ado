@@ -1,0 +1,150 @@
+{
+  "_comment": "Copy this to mappings.json and adjust for your instance. mappings.json is gitignored so your instance-specific value maps stay out of source control. The structure below (types, fields, states, links) is generic Scrum/ADO config; the three value maps near the bottom (TeamValueMap, StrategicThemeValueMap, ThemeAreaPaths) hold YOUR org's values and are shown here only as examples.",
+
+  "Process": "Scrum",
+
+  "BugBehavior": "Requirements",
+
+  "WorkItemTypes": {
+    "Epic": "Epic",
+    "NestedEpic": "Feature",
+    "Story": "Product Backlog Item",
+    "Defect": "Bug",
+    "Task": "Task",
+    "Issue": "Impediment"
+  },
+
+  "_comment_Fields": "Estimate is Effort everywhere EXCEPT Task, which has no Effort field in Scrum and uses Remaining Work instead. Resolution is only set for Issue: Impediment has the field but Bug does not, so Defect keeps putting its Resolution in the description. BusinessValue is Epic/Feature/PBI only; Bug has no such field.",
+  "Fields": {
+    "Estimate": "Microsoft.VSTS.Scheduling.Effort",
+    "TaskEstimate": "Microsoft.VSTS.Scheduling.RemainingWork",
+    "Resolution": "Microsoft.VSTS.Common.Resolution",
+    "BusinessValue": "Microsoft.VSTS.Common.BusinessValue",
+    "Owners": "System.AssignedTo",
+    "PlannedStart": "Microsoft.VSTS.Scheduling.StartDate",
+    "PlannedEnd": "Microsoft.VSTS.Scheduling.TargetDate",
+    "Order": "Microsoft.VSTS.Common.BacklogPriority",
+    "ClosedDate": "Microsoft.VSTS.Common.ClosedDate",
+    "Environment": "Microsoft.VSTS.TCM.SystemInfo",
+    "FoundInBuild": "Microsoft.VSTS.Build.FoundIn"
+  },
+
+  "_comment_RequiredFields": "Custom string fields written on EVERY item of EVERY type, so AssertFieldsExist checks them on all types before the first create. ADO silently drops a write to a field a type does not have (validateOnly too), so without that check a missing field is a silent data loss rather than an error. Add these fields to every work item type in your process first. Both Category and FY are written empty when the source has no value.",
+  "RequiredFields": {
+    "AgilityId": "Custom.DigitalAIID",
+    "AgilityStatus": "Custom.DigitalAIStatus",
+    "AgilityCategory": "Custom.DigitalAICategory",
+    "AgilityFY": "Custom.DigitalAIFY"
+  },
+
+  "_comment_CustomFields": "Custom fields that exist on only SOME work item types. Each lists the ADO types it lives on; BuildFieldPatch writes it only there and AssertFieldsExist checks the same set. StrategicTheme uses the Microsoft DevLabs multi-value control (stored as a semicolon-separated string). BugResolution/ImpedimentResolution carry the source ResolutionReason for Defect/Issue.",
+  "CustomFields": {
+    "Owners":               { "Field": "Custom.DigitalAIOwners",               "AdoTypes": ["Epic", "Feature", "Product Backlog Item", "Bug", "Task", "Impediment"] },
+    "Team":                 { "Field": "Custom.DigitalAITeam",                 "AdoTypes": ["Epic", "Feature", "Product Backlog Item", "Bug", "Task", "Impediment"] },
+    "Mandate":              { "Field": "Custom.DigitalAIMandate",              "AdoTypes": ["Epic", "Feature"] },
+    "StrategicTheme":       { "Field": "Custom.DigitalAIStrategicTheme",       "AdoTypes": ["Epic", "Feature"] },
+    "BugResolution":        { "Field": "Custom.DigitalAIBugResolution",        "AdoTypes": ["Bug"] },
+    "ImpedimentResolution": { "Field": "Custom.DigitalAIImpedimentResolution", "AdoTypes": ["Impediment"] }
+  },
+
+  "_comment_ValueMaps": "EXAMPLES - replace with your org's values. Source raw value -> cleaned ADO dropdown value. Match is trim-then-exact and CASE SENSITIVE. A value NOT in its map is not written; it is recorded in the field-value warnings (id, type, map, raw) so a new value surfaces rather than being silently dropped. Use these to normalize messy source values, fix spelling, or consolidate duplicates onto one canonical value.",
+  "TeamValueMap": {
+    "raw_team_a": "Team A",
+    "raw_team_b": "Team B"
+  },
+  "StrategicThemeValueMap": {
+    "Example Goal One": "Example Goal One",
+    "Exampl Goal Two (typo)": "Example Goal Two",
+    "Duplicate Of Goal One": "Example Goal One"
+  },
+
+  "_comment_LinkTypes": "The source 'this Issue blocks that work item' becomes Affects. NOT Parent/Child: a single Issue can block many items and a tree topology allows one parent, so hierarchy cannot express it.",
+  "LinkTypes": {
+    "Blocks": "Microsoft.VSTS.Common.Affects-Forward",
+    "Parent": "System.LinkTypes.Hierarchy-Reverse",
+    "Related": "System.LinkTypes.Related"
+  },
+
+  "_comment_Tags": "Tags: an unmigrated parent, unmigrated blocked items, and a Defect's Source. Parent and blocks are kept as tags because they are worth querying. Documentation only: BuildTags names these itself, so editing them here changes nothing.",
+  "Tags": {
+    "UnmigratedParent": "agility-parent",
+    "UnmigratedBlocked": "agility-blocks",
+    "Source": "agility-source"
+  },
+
+  "_comment_ThemeAreaPaths": "EXAMPLES - replace with your org's Themes. A Story's/Defect's Theme supplies the area path leaf under the scope's area path (Theme name -> ADO node name, which may differ). A Theme with no entry, or an item with no Theme, falls back to the scope's own area path. List every Theme carrying a Story or Defect across all scopes (with -IncludeClosed). ADO rejects an unknown area path (TF401347), so run CreateAreaPaths after editing.",
+  "ThemeAreaPaths": {
+    "Applications": "Apps",
+    "Databases": "Databases",
+    "Networking": "Networking"
+  },
+
+  "_comment_States": "Per source asset type, because ADO states differ per work item type. Impediment only has Open and Closed. ClosedState wins over Map for anything closed in the source, whatever its Status says.",
+  "States": {
+    "Epic": {
+      "DefaultState": "New",
+      "ClosedState": "Done",
+      "Map": {
+        "Future": "New",
+        "Ready": "New",
+        "In Progress": "In Progress",
+        "Done": "Done",
+        "Accepted": "Done"
+      }
+    },
+    "Story": {
+      "DefaultState": "New",
+      "ClosedState": "Done",
+      "Map": {
+        "Not Started": "New",
+        "Ready": "Approved",
+        "Committed": "Approved",
+        "In Progress": "In Progress",
+        "On Hold": "New",
+        "Done": "Done",
+        "Completed": "Done",
+        "Accepted": "Done"
+      }
+    },
+    "Defect": {
+      "DefaultState": "New",
+      "ClosedState": "Done",
+      "Map": {
+        "Not Started": "New",
+        "Ready": "Approved",
+        "Committed": "Approved",
+        "In Progress": "In Progress",
+        "On Hold": "New",
+        "Done": "Done",
+        "Done Done": "Done",
+        "Completed": "Done",
+        "Stories Done": "Done",
+        "Accepted": "Done"
+      }
+    },
+    "Issue": {
+      "DefaultState": "Open",
+      "ClosedState": "Closed",
+      "Map": {}
+    },
+    "_comment_Task": "Task's default is To Do, not New: it is the one type here whose Proposed state is not called New.",
+    "Task": {
+      "DefaultState": "To Do",
+      "ClosedState": "Done",
+      "Map": {
+        "In Progress": "In Progress",
+        "Completed": "Done",
+        "Done": "Done"
+      }
+    }
+  },
+
+  "Priorities": {
+    "DefaultPriority": 2,
+    "Map": {
+      "High": 1,
+      "Medium": 2,
+      "Low": 3
+    }
+  }
+}
