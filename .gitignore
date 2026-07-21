@@ -1,0 +1,21 @@
+# Local configuration containing tokens and instance details
+appsettings.json
+
+# Instance-specific value maps (copy mappings.sample.json to mappings.json)
+mappings.json
+
+# PowerShell / editor
+*.suo
+*.user
+.vs/
+.vscode/
+TestResults/
+*.log
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local notes and internal working docs (README stays public)
+/*.md
+!README.md
