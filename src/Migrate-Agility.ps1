@@ -32,6 +32,11 @@ $script:logWriter = $null
 $script:totalFailed = 0
 $script:TitleLimit = 255
 
+# Azure DevOps rejects an attachment over 60 MB by default. Anything bigger is skipped with a warning
+# rather than failing the work item, which by then already exists. The largest Agility Epic attachment
+# is 3.3 MB, so this is a guard against surprises rather than a limit anyone is near.
+$script:AttachmentMaxBytes = 60MB
+
 # Stands in for an ADO id in the tag map during a dry run.
 #
 # A real run creates in dependency order and adds each new id to the tag map, so by the time Issues
@@ -51,29 +56,36 @@ function Main
   Write-Host
 
   # Futz with these. -DryRun writes nothing, to either system.
-  # CreateAreaPaths -DryRun                                         # list the area nodes needed
-  # CreateAreaPaths                                                 # create them; run after adding a scope
-  # MaterializeOwners -DryRun -Types Epic                          # list owners that would be added to the org
-  # MaterializeOwners -Types Epic                                  # add them as free Stakeholders (needs admin PAT)
-  # MaterializeOwners                                              # all types' owners, before the full migration
-  # DeleteAllTasks -DryRun                                         # count the Tasks that would be deleted
-  # DeleteAllTasks                                                 # PERMANENTLY delete every Task, then re-run Tasks
-  # Migrate -DryRun -IncludeClosed -Types Story,Defect,Issue
-  # Migrate -DryRun -IncludeClosed -Types Task -Scope "Scope:2463"  # Task has NEVER been dry run
-  # Migrate -DryRun -IncludeClosed -Types Story,Defect,Issue -Scope "Scope:2463"  # one scope
-  # Migrate -IncludeClosed -Types Story,Defect,Issue                # the real thing, 8,673 items
-  # Migrate -DryRun -IncludeClosed                                  # all five types, ~52,000 items
-  # Migrate -IncludeClosed -Types Task                              # 43,436 Tasks on their own
-  # Migrate -Types Task                                             # 2,275 open Tasks only
-  # Migrate -DryRun -IncludeClosed -Scope "Scope:16163"             # the EDU scope (Scope:16163), 466 items
-  # Migrate -DryRun -IncludeClosed -Scope "Scope:16163"
+  #
+  # Closed items always migrate; only Dead placeholder templates are ever excluded.
+  #
+  # CreateAreaPaths -DryRun                               # list the area nodes needed
+  # CreateAreaPaths                                       # create them; run after adding a scope
+  # MaterializeOwners -DryRun -Types Epic                 # list owners that would be added to the org
+  # MaterializeOwners -Types Epic                         # add them as free Stakeholders (needs admin PAT)
+  # MaterializeOwners                                     # all types' owners, before the full migration
+  #
+  # Deletes are PERMANENT (destroy=true, no recycle bin) and take one type at a time. Always -DryRun
+  # first. Deleting a type ORPHANS whatever hangs off it - Features hang off Epics, PBIs and Bugs off
+  # Epics, Tasks off PBIs and Bugs - and a rerun only relinks items it CREATES, so plan to re-migrate
+  # the children too.
+  # DeleteAllEpics -DryRun                                # count; then drop -DryRun to delete
+  # DeleteAllFeatures -DryRun
+  # DeleteAllProductBacklogItems -DryRun
+  # DeleteAllBugs -DryRun
+  # DeleteAllTasks -DryRun
+  # DeleteAllImpediments -DryRun
+  # Migrate -DryRun -Types Epic                           # 877 Epics and Features
+  # Migrate -Types Epic                                   # the real Epic run
+  # Migrate -DryRun -Types Story,Defect,Issue
+  # Migrate -Types Story,Defect,Issue                     # 8,673 items
+  # Migrate -DryRun -Types Task -Scope "Scope:2463"       # one scope
+  # Migrate -Types Task                                   # 43,436 Tasks on their own
+  # Migrate -DryRun -Scope "Scope:16163"                  # the EDU scope, 466 items
+  # Migrate -DryRun                                       # all five types, ~52,000 items
+  # Migrate                                               # the whole migration
 
-  # Migrate -Types Epic -IncludeClosed
-  # Migrate -IncludeClosed 
-
-  # DeleteAllTasks
-  # Migrate -Types Task -IncludeClosed  
-
+  Migrate
 }
 
 # The whole run: read Agility, resolve links, write Azure DevOps.
@@ -84,15 +96,22 @@ function Main
 # -Types selects which Agility asset types to migrate. The order below is dependency order: Epics
 # must exist before Stories and Defects can be parented to them. Reruns are safe, so re-including
 # Epic just skips the 858 already there.
-function Migrate([switch]$DryRun, [string]$Scope, [switch]$IncludeClosed, [string[]]$Types = @('Epic','Story','Defect','Task','Issue'))
+function Migrate([switch]$DryRun, [string]$Scope, [string[]]$Types = @('Epic','Story','Defect','Task','Issue'))
 {
   # Inner functions read these, and each call starts a fresh run.
   $script:DryRun = [bool]$DryRun
-  $script:IncludeClosed = [bool]$IncludeClosed
   $script:created = 0
   $script:skipped = 0
   $script:failed = 0
   $script:warnings = 0
+  # Of the created items, how many were archived into their type's stale state. Reported in the
+  # summary because on this data it is expected to be most of them, and a number nobody expected is
+  # the cheapest way to catch a cutoff that is wrong by a factor of a year.
+  $script:removed = 0
+  # Files moved from Agility into ADO, and the ones that would not move. Reported separately from
+  # item counts because a failed file does not fail its item.
+  $script:attachmentsCopied = 0
+  $script:attachmentsFailed = 0
   # Raw values a value map has never seen (id, type, map, raw). Not written to their field, recorded
   # here so a new Team or strategic theme surfaces in the summary instead of vanishing.
   $script:fieldWarnings = @()
@@ -107,11 +126,16 @@ function Migrate([switch]$DryRun, [string]$Scope, [switch]$IncludeClosed, [strin
   StartLog
   $script:runStarted = Get-Date
   WriteLogDetail "Migrate-Agility log, started $($script:runStarted.ToString('yyyy-MM-dd HH:mm:ss'))"
-  WriteLogDetail "Switches: DryRun=$($script:DryRun) IncludeClosed=$($script:IncludeClosed) Types=$($Types -join ',') Scope=$(if ($Scope) { $Scope } else { 'all configured' })"
+  WriteLogDetail "Switches: DryRun=$($script:DryRun) Types=$($Types -join ',') Scope=$(if ($Scope) { $Scope } else { 'all configured' })"
   WriteLogDetail ""
 
   $script:config = GetConfig $script:configPath
   $script:mappings = GetConfig $script:mappingsPath
+
+  # Work finished before this moment is created in its type's stale state instead of its closed one.
+  # Resolved once here so every item in the run is measured against the same instant, and left $null
+  # when mappings.json configures no rule.
+  $script:staleBefore = ResolveStaleCutoff $script:runStarted
 
   $scopes = $script:config.Agility.Scopes
   if ($Scope)
@@ -126,7 +150,10 @@ function Migrate([switch]$DryRun, [string]$Scope, [switch]$IncludeClosed, [strin
   WriteLog "Into $($script:config.AzureDevOps.OrganizationUrl) project $($script:config.AzureDevOps.Project)"
   foreach ($s in $scopes) { WriteLog "  $($s.Scope) -> area path $(FormatAreaPath $s.AreaPath)" }
   if ($script:DryRun) { WriteLog "DRY RUN - nothing will be written to Azure DevOps" Yellow }
-  if ($script:IncludeClosed) { WriteLog "Including closed items" }
+  if ($script:staleBefore)
+  {
+    WriteLog "Archiving: work finished before $($script:staleBefore.ToString('yyyy-MM-dd')) is created Removed, not Done" Yellow
+  }
   WriteLog
 
   WriteLog "Resolving credentials..."
@@ -180,9 +207,6 @@ function Migrate([switch]$DryRun, [string]$Scope, [switch]$IncludeClosed, [strin
 function CreateAreaPaths([switch]$DryRun)
 {
   $script:DryRun = [bool]$DryRun
-  # Themes on closed items count: the Theme list measured off open Stories alone is missing 13 of
-  # the 17, which is exactly how ~1,236 items came to have no mapping.
-  $script:IncludeClosed = $true
   $script:created = 0
   $script:skipped = 0
   $script:failed = 0
@@ -218,13 +242,30 @@ function CreateAreaPaths([switch]$DryRun)
 
     # Only Story and Defect carry a Theme, so only they can need a leaf. Epic, Task and Issue have
     # no Theme and land on the scope's own area path.
+    #
+    # A scope with NO area path of its own is the case the Team fallback exists for, so this counts
+    # every type there: whatever the migration will resolve, this has to have created.
     $themes = @{}
-    foreach ($type in @('Story','Defect'))
+    $teamPaths = @{}
+    foreach ($type in @('Epic','Story','Defect','Task','Issue'))
     {
       foreach ($a in (GetAgilityAssets $type $s.Scope))
       {
-        if ($a.Theme) { $themes[$a.Theme] = ($themes[$a.Theme] + 1) }
+        if ($a.Theme -and ($type -eq 'Story' -or $type -eq 'Defect')) { $themes[$a.Theme] = ($themes[$a.Theme] + 1) }
+
+        if (-not $s.AreaPath)
+        {
+          $resolved = ResolveAreaPath $s.AreaPath $a.Theme $a.Team
+          if ($resolved) { $teamPaths[$resolved] = ($teamPaths[$resolved] + 1) }
+        }
       }
+    }
+
+    # Nodes the Team fallback will ask for. These are normally other scopes' own area paths, so they
+    # already exist and report EXISTS; this is here so a NEW TeamAreaPaths target cannot be missing.
+    foreach ($path in ($teamPaths.Keys | Sort-Object))
+    {
+      EnsureAreaPath $path $have $teamPaths[$path]
     }
 
     foreach ($theme in ($themes.Keys | Sort-Object))
@@ -353,8 +394,6 @@ function GetAreaPaths
 function MaterializeOwners([switch]$DryRun, [string[]]$Types = @('Epic', 'Story', 'Defect', 'Task', 'Issue'))
 {
   $script:DryRun = [bool]$DryRun
-  # Closed items' owners count too: an owner only on closed work still needs to exist to be assigned.
-  $script:IncludeClosed = $true
   $script:created = 0
   $script:skipped = 0
   $script:failed = 0
@@ -441,8 +480,10 @@ function GetDistinctOwners($agilityTypes)
 
     foreach ($s in $script:config.Agility.Scopes)
     {
+      # An owner only ever named on closed work still has to exist to be assignable, so this reads
+      # the same set the migration does.
       $where = "Scope='$($s.Scope)'"
-      $where += if ($script:IncludeClosed) { ";AssetState!='Dead'" } else { ";AssetState!='Closed'" }
+      $where += ";AssetState!='Dead'"
 
       $start = 0
       while ($true)
@@ -531,22 +572,42 @@ function EntitleStakeholder([string]$email)
 # destroy=true is PERMANENT: the Tasks do not go to the recycle bin and cannot be recovered. That is
 # the intent (a clean slate for 40k+ Tasks would otherwise flood the bin). -DryRun reports the count
 # without deleting. The WHERE clause is hard pinned to System.WorkItemType = 'Task'; a test asserts it.
-function DeleteAllTasks([switch]$DryRun)
+# The ADO work item types these helpers are allowed to delete. An unrecognised name throws rather
+# than running a query whose type clause matches nothing (or, one careless edit later, everything).
+# This is the same rail as the Agility side's AssetState filter: the danger is the filter going
+# missing, and these destroy permanently.
+$script:DeletableAdoTypes = @('Epic', 'Feature', 'Product Backlog Item', 'Bug', 'Task', 'Impediment')
+
+function DeleteAllEpics([switch]$DryRun)               { DeleteAllOfType 'Epic'                 -DryRun:$DryRun }
+function DeleteAllFeatures([switch]$DryRun)            { DeleteAllOfType 'Feature'              -DryRun:$DryRun }
+function DeleteAllProductBacklogItems([switch]$DryRun) { DeleteAllOfType 'Product Backlog Item' -DryRun:$DryRun }
+function DeleteAllBugs([switch]$DryRun)                { DeleteAllOfType 'Bug'                  -DryRun:$DryRun }
+function DeleteAllTasks([switch]$DryRun)               { DeleteAllOfType 'Task'                 -DryRun:$DryRun }
+function DeleteAllImpediments([switch]$DryRun)         { DeleteAllOfType 'Impediment'           -DryRun:$DryRun }
+
+# Deletes every work item of ONE type in the project. The named wrappers above are the intended entry
+# points; this takes the type so the delete loop exists once rather than six times.
+function DeleteAllOfType([string]$adoType, [switch]$DryRun)
 {
+  if ($script:DeletableAdoTypes -notcontains $adoType)
+  {
+    throw "'$adoType' is not a work item type this can delete. Use one of: $($script:DeletableAdoTypes -join ', ')."
+  }
+
   $script:DryRun = [bool]$DryRun
   $deleted = 0
   $failed = 0
 
   StartLog
   $script:runStarted = Get-Date
-  WriteLogDetail "DeleteAllTasks log, started $($script:runStarted.ToString('yyyy-MM-dd HH:mm:ss'))"
+  WriteLogDetail "DeleteAllOfType '$adoType' log, started $($script:runStarted.ToString('yyyy-MM-dd HH:mm:ss'))"
   WriteLogDetail ""
 
   $script:config = GetConfig $script:configPath
 
-  WriteLog "Deleting ALL Task work items in $($script:config.AzureDevOps.OrganizationUrl) project $($script:config.AzureDevOps.Project)"
+  WriteLog "Deleting ALL $adoType work items in $($script:config.AzureDevOps.OrganizationUrl) project $($script:config.AzureDevOps.Project)"
   if ($script:DryRun) { WriteLog "DRY RUN - nothing will be deleted" Yellow }
-  else { WriteLog "PERMANENT (destroy=true): these Tasks CANNOT be recovered from the recycle bin" Red }
+  else { WriteLog "PERMANENT (destroy=true): these $adoType items CANNOT be recovered from the recycle bin" Red }
   WriteLog
 
   WriteLog "Resolving credentials..."
@@ -554,13 +615,13 @@ function DeleteAllTasks([switch]$DryRun)
   WriteLog
 
   $org = $script:config.AzureDevOps.OrganizationUrl.TrimEnd('/')
-  $ids = GetAllTaskIds
-  WriteLog "Found $($ids.Count) Task work items"
+  $ids = GetAllIdsOfType $adoType
+  WriteLog "Found $($ids.Count) $adoType work items"
   WriteLog
 
   if ($script:DryRun)
   {
-    WriteLog "  WOULD delete $($ids.Count) Tasks (destroy, permanent). First ids: $((@($ids) | Select-Object -First 10) -join ', ')"
+    WriteLog "  WOULD delete $($ids.Count) $adoType items (destroy, permanent). First ids: $((@($ids) | Select-Object -First 10) -join ', ')"
   }
   else
   {
@@ -577,7 +638,7 @@ function DeleteAllTasks([switch]$DryRun)
       catch
       {
         WriteLog "  FAIL    #$id could not be deleted - $(ReadAdoError $_)" Red
-        WriteErrorDetail $_ "delete Task #$id"
+        WriteErrorDetail $_ "delete $adoType #$id"
         $failed++
       }
 
@@ -599,9 +660,11 @@ function DeleteAllTasks([switch]$DryRun)
   }
 }
 
-# Every Task id in the project, walked with a System.Id watermark so it survives past the 20,000 row
-# WIQL cap (the same reason GetMigratedTagMap pages). $top keeps each query small and steady.
-function GetAllTaskIds
+# Every id of one type in the project, walked with a System.Id watermark so it survives past the
+# 20,000 row WIQL cap (the same reason GetMigratedIdMap pages). $top keeps each query small and
+# steady. The type is quoted into the WHERE clause; a name with spaces ('Product Backlog Item')
+# needs no escaping beyond the single quotes WIQL already uses.
+function GetAllIdsOfType([string]$adoType)
 {
   $org = $script:config.AzureDevOps.OrganizationUrl.TrimEnd('/')
   $project = $script:config.AzureDevOps.Project
@@ -611,7 +674,7 @@ function GetAllTaskIds
 
   while ($true)
   {
-    $wiql = @{ query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [System.WorkItemType] = 'Task' AND [System.Id] > $lastId ORDER BY [System.Id]" }
+    $wiql = @{ query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [System.WorkItemType] = '$adoType' AND [System.Id] > $lastId ORDER BY [System.Id]" }
     $url = "{0}/{1}/_apis/wit/wiql?`$top={2}&api-version=7.1" -f $org, [uri]::EscapeDataString($project), $pageSize
 
     $response = InvokeAdoRequest $url "Post" $wiql "application/json"
@@ -636,8 +699,12 @@ function MigrateEpics($scopes, $existing)
   foreach ($s in $scopes)
   {
     $batch = GetAgilityAssets 'Epic' $s.Scope
-    # The area path comes from the scope the Epic was read from, so carry it on the asset.
-    foreach ($a in $batch) { $a | Add-Member -NotePropertyName AreaPath -NotePropertyValue $s.AreaPath -Force }
+    # The area path comes from the scope the Epic was read from. Epics have no Theme (measured: 0 of
+    # 877), so the Team is the only thing that can place one whose scope is the project root.
+    foreach ($a in $batch)
+    {
+      $a | Add-Member -NotePropertyName AreaPath -NotePropertyValue (ResolveAreaPath $s.AreaPath $null $a.Team) -Force
+    }
     WriteLog "Read $($batch.Count) Epics from $($s.Scope)"
     $assets += $batch
   }
@@ -667,7 +734,7 @@ function MigrateWorkitems([string]$agilityType, $scopes, $existing)
     $batch = GetAgilityAssets $agilityType $s.Scope
     foreach ($a in $batch)
     {
-      $a | Add-Member -NotePropertyName AreaPath -NotePropertyValue (ResolveAreaPath $s.AreaPath $a.Theme) -Force
+      $a | Add-Member -NotePropertyName AreaPath -NotePropertyValue (ResolveAreaPath $s.AreaPath $a.Theme $a.Team) -Force
       $a | Add-Member -NotePropertyName AdoType -NotePropertyValue $script:mappings.WorkItemTypes.$agilityType -Force
       # Only Epics are ever flattened, and only Epics carry a true parent worth recording.
       $a | Add-Member -NotePropertyName ParentOid -NotePropertyValue $a.SuperOid -Force
@@ -907,6 +974,58 @@ function InvokeAgilityGet([string]$url)
   }
 }
 
+# The SECOND door to Agility, for attachment bytes. The JSON reader above cannot return a binary
+# body, so this exists - and it carries exactly the same guarantee: -Method Get is hard coded, there
+# is no method parameter, and a test asserts both. Do not add one.
+function InvokeAgilityDownload([string]$url)
+{
+  # The wrapper object and the leading comma are both load bearing, and neither is decoration.
+  #
+  # PowerShell ENUMERATES a collection on output, so a byte[] handed back through a pipeline arrives
+  # as an Object[] of boxed bytes. It has the same .Length, so nothing looks wrong - and then the
+  # upload stringifies it. Measured live: a 40,593 byte .docx reached ADO as 134,696 bytes, and all
+  # nine files on E-03934 inflated by about 3.3x.
+  #
+  # A PSCustomObject is not enumerable, so it carries the array through InvokeWithRetry intact; the
+  # leading comma then protects it from this function's own output enumeration.
+  $result = InvokeWithRetry {
+    [pscustomobject]@{
+      Content = (Invoke-WebRequest -Uri $url -Method Get -Headers $script:agilityHeaders -ErrorAction Stop).Content
+    }
+  }
+
+  return ,$result.Content
+}
+
+# The numeric id inside an attachment oid ("Attachment:243961" -> "243961"), which is what the byte
+# endpoint takes. Returns $null for anything that is not an oid, so a junk value builds no url at all.
+function AgilityAttachmentId($oid)
+{
+  if (-not $oid) { return $null }
+
+  $parts = ([string]$oid).Split(':')
+  if ($parts.Count -lt 2) { return $null }
+  if ($parts[1] -notmatch '^\d+$') { return $null }
+
+  return $parts[1]
+}
+
+# The raw bytes of one attachment.
+#
+# NOT the rest-1.v1 data endpoint: that returns the Content blob base64'd inside JSON. attachment.img
+# serves the file itself, verified against a 2.6 MB .docx and a 181 KB .msg that both round tripped
+# byte for byte into ADO.
+function GetAgilityAttachmentBytes([string]$oid)
+{
+  $id = AgilityAttachmentId $oid
+  if (-not $id) { return $null }
+
+  $url = "{0}/attachment.img/{1}" -f $script:config.Agility.BaseUrl.TrimEnd('/'), $id
+
+  # Comma again: a bare return would enumerate the byte[] straight back into an Object[].
+  return ,(InvokeAgilityDownload $url)
+}
+
 # Attributes are per asset type, and asking for one a type does not have is an HTTP 400 "Unknown
 # token" that fails the whole page rather than one field. So each type gets its own selection.
 #
@@ -917,8 +1036,18 @@ function GetSelection([string]$agilityType)
   # CreatedBy.Name/Email is on every asset type (a BaseAsset attribute) and becomes the assignee when
   # an item has no owner, so it rides in the common list rather than each type's. CreateDate,
   # ChangeDateUTC and ChangedBy feed the two-point revision history, also on every type.
+  # ClosedBy, TaggedWith, Attachments and Links exist on EVERY type here and carry data on all of
+  # them, so they belong in the shared list rather than repeated five times (measured 2026-07-30):
+  #   ClosedBy    Epic 773  Story 7,274  Defect 699  Task 41,643  Issue 345
+  #   TaggedWith  Epic  27  Story   351  Defect   5  Task    957  Issue  10
+  #   Attachments Epic  61  Story   639  Defect  74  Task  1,294  Issue  13
+  #   Links       Epic   5  Story   204  Defect  11  Task    167  Issue   0 (exists, empty)
+  #
+  # Attachments and Links are each TWO lists off one relation (oid + filename, url + name), so they
+  # are read aligned; an entry missing one half must not slide the others up a slot.
   $common = "Name,Number,Description,Scope,AssetState,Team.Name,Order,CreatedBy.Name,CreatedBy.Email," +
-            "CreateDate,ChangeDateUTC,ChangedBy.Name,ChangedBy.Email"
+            "CreateDate,ChangeDateUTC,ChangedBy.Name,ChangedBy.Email," +
+            "ClosedBy.Name,ClosedBy.Email,TaggedWith,Attachments,Attachments.Filename,Links.URL,Links.Name"
 
   switch ($agilityType)
   {
@@ -927,23 +1056,42 @@ function GetSelection([string]$agilityType)
       # Value is the Agility business value and Swag is the Epic estimate. Both are real, and both
       # are nearly empty: Value on 2 of 858, Swag on 10. They are selected anyway because the cost
       # is a token and the alternative is losing the few that exist.
+      # The tail of this list came from auditing all 143 attributes the Epic type declares against
+      # the live data (2026-07-30). Source 93, Dependencies 20, Dependants 16 were unread until then.
       return "$common,Swag,Value,Status.Name,Priority.Name,Super,Owners.Name,Owners.Email," +
-             "PlannedStart,PlannedEnd,ClosedDate,Category.Name,Custom_FiscalYear.Name,Custom_Mandate.Name,StrategicThemes.Name"
+             "PlannedStart,PlannedEnd,ClosedDate,Category.Name,Custom_FiscalYear.Name,Custom_Mandate.Name,StrategicThemes.Name," +
+             "Source.Name,Dependencies.Number,Dependants.Number," +
+             # These four have no ADO field on Scrum's Epic or Feature, so they ride in the
+             # description's Agility details block: Personas 28, Risk 41, Reference 6, RequestedBy 6.
+             "Custom_PersonaImpacts.Name,Risk,Reference,RequestedBy"
     }
     'Story'
     {
       # Super.Number, not just Super: the Epic is usually not loaded in the same run, so its oid
       # alone cannot be turned into the agility:<Number> tag that finds it in ADO.
+      #
+      # Story's dependencies dwarf Epic's: 2,579 carry one and 2,269 are depended on, against 20/16
+      # on Epic, and one Story is depended on by 36 others. RequestedBy (474) and Reference (1) have
+      # no ADO field and ride in the description's Agility details block.
+      #
+      # NOT selected: Custom_PersonaImpacts and Risk exist but are empty on all 7,683, and
+      # OriginalEstimate (4,203) has no field on ANY type in this process, so there is nowhere to
+      # put it - verified against every work item type's field list.
       return "$common,Estimate,Status.Name,Priority.Name,Super,Super.Number,Owners.Name,Owners.Email," +
-             "Parent.Name,Timebox.Name,ClosedDate,Category.Name"
+             "Parent.Name,Timebox.Name,ClosedDate,Category.Name," +
+             "Dependencies.Number,Dependants.Number,Reference,RequestedBy"
     }
     'Defect'
     {
       # No Category here: Defect has no such attribute, and asking for it is a 400 that fails the
       # whole read. Its nearest equivalents, Type and DeliveryCategory, are empty on all 704
       # Defects, so there is nothing to map. Source is the one that carries data (23 of 704).
+      #
+      # Risk and RequestedBy do NOT exist on Defect (Epic and Story have them), so asking is a 400.
+      # Reference and Custom_PersonaImpacts exist but are empty on all 709.
       return "$common,Estimate,Status.Name,Priority.Name,Super,Super.Number,Owners.Name,Owners.Email," +
-             "Parent.Name,Timebox.Name,ClosedDate,Resolution,ResolutionReason.Name,Environment,FoundInBuild,Source.Name"
+             "Parent.Name,Timebox.Name,ClosedDate,Resolution,ResolutionReason.Name,Environment,FoundInBuild,Source.Name," +
+             "Dependencies.Number,Dependants.Number"
     }
     'Issue'
     {
@@ -954,8 +1102,11 @@ function GetSelection([string]$agilityType)
       # BlockedPrimaryWorkitems and BlockedEpics are the Stories, Defects and Epics this Issue
       # blocks, and .Number is what turns them into agility:<Number> tag lookups. Issues migrate
       # last, so everything they point at is already in ADO.
+      #
+      # Issue has NO Dependencies or Dependants attribute at all, so those are absent by necessity
+      # rather than choice. Reference carries 2 values and rides in the description.
       return "$common,Owner.Name,Owner.Email,Category.Name,TargetDate,ClosedDate," +
-             "Resolution,ResolutionReason.Name,BlockedPrimaryWorkitems.Number,BlockedEpics.Number"
+             "Resolution,ResolutionReason.Name,BlockedPrimaryWorkitems.Number,BlockedEpics.Number,Reference"
     }
     'Task'
     {
@@ -966,6 +1117,11 @@ function GetSelection([string]$agilityType)
       #
       # Team and Timebox are read only on Task (inherited from the parent Story), but they still
       # select and still carry data, so the tags and the iteration path work the same way.
+      #
+      # Task has NO Dependencies or Dependants attribute, and no Risk, RequestedBy or
+      # OriginalEstimate either; asking for any of them is a 400. DetailEstimate is selected and
+      # carries 42,438 values, but Scrum's Task has no Original Estimate field to put it in (checked
+      # against every type's field list), so the parser keeps reading ToDo alone for Remaining Work.
       return "$common,Estimate,DetailEstimate,ToDo,Status.Name,Owners.Name,Owners.Email," +
              "Parent,Parent.Number,Parent.Name,Parent.Parent.Name,Timebox.Name,ClosedDate,Category.Name"
     }
@@ -978,12 +1134,14 @@ function GetAgilityAssets([string]$agilityType, [string]$agilityScope)
 {
   $selection = GetSelection $agilityType
 
-  # Agility AssetState: 64 Active, 128 Closed, 200 Dead. The Dead epics in the scopes are
-  # placeholder templates ("IT - Registration Checklist - <insert semester>"), so they are excluded
-  # either way. Dropping the filter entirely would migrate them, which is why -IncludeClosed still
-  # filters rather than passing no where clause at all.
+  # Agility AssetState: 64 Active, 128 Closed, 200 Dead.
+  #
+  # Closed items ALWAYS migrate - every real run wanted them, so the switch that used to gate it was
+  # removed. Dead is a different matter: those are placeholder templates ("IT - Registration
+  # Checklist - <insert semester>") and must never be created. So there is still a filter here, and
+  # it must never become an empty where clause: no filter at all would migrate the templates.
   $where = "Scope='$agilityScope'"
-  $where += if ($script:IncludeClosed) { ";AssetState!='Dead'" } else { ";AssetState!='Closed'" }
+  $where += ";AssetState!='Dead'"
 
   $pageSize = 50
   $start = 0
@@ -1139,8 +1297,48 @@ function ConvertFromAgilityAssets($response, [string]$agilityType = 'Epic')
       Category     = GetAttributeValue $attributes "Category.Name"
       Source       = GetAttributeValue $attributes "Source.Name"
       Team         = GetAttributeValue $attributes "Team.Name"
-      FiscalYear   = GetAttributeValue $attributes "Custom_FiscalYear.Name"
-      Mandate      = GetAttributeValue $attributes "Custom_Mandate.Name"
+
+      # Both of these are MULTI VALUE relations, and both were read as scalars until 2026-07-30.
+      # 42 of the 114 Epics with a fiscal year carry more than one (up to 4), so reading the first
+      # dropped 59 values; 2 of the 90 with a mandate carry two. The scalars are kept for any caller
+      # that wants one, but the field patch writes the whole list.
+      FiscalYear   = GetAttributeValue  $attributes "Custom_FiscalYear.Name"
+      FiscalYears  = GetAttributeValues $attributes "Custom_FiscalYear.Name"
+      Mandate      = GetAttributeValue  $attributes "Custom_Mandate.Name"
+      Mandates     = GetAttributeValues $attributes "Custom_Mandate.Name"
+
+      # Agility's own tag list (27 Epics, up to 5 each). Goes to System.Tags, which is already written.
+      AgilityTags  = GetAttributeValues $attributes "TaggedWith"
+
+      # Four Epic attributes with no field on Scrum's Epic or Feature. The user chose the description
+      # over new custom fields, so these go to the Agility details block. Personas is multi value
+      # (up to 4); Risk is a number; Reference and RequestedBy are free text, and RequestedBy is NOT
+      # an identity (two of the six hold several names, one is "ESM workgroup").
+      Personas     = GetAttributeValues $attributes "Custom_PersonaImpacts.Name"
+      Risk         = GetAttributeValue  $attributes "Risk"
+      Reference    = GetAttributeValue  $attributes "Reference"
+      RequestedBy  = GetAttributeValue  $attributes "RequestedBy"
+
+      # Epic to Epic dependencies, both directions. Dependencies are the ones this Epic waits on
+      # (Successor in ADO terms); Dependants wait on this one (Predecessor).
+      DependencyNumbers = GetAttributeValues $attributes "Dependencies.Number"
+      DependantNumbers  = GetAttributeValues $attributes "Dependants.Number"
+
+      # The person who closed it, for Microsoft.VSTS.Common.ClosedBy. An identity, so it is written
+      # in a rule-checked patch and only when ADO will accept it.
+      ClosedByName  = GetAttributeValue $attributes "ClosedBy.Name"
+      ClosedByEmail = GetAttributeValue $attributes "ClosedBy.Email"
+
+      # Two lists off ONE relation, so index i must mean the same link in both: read ALIGNED, never
+      # filtered. A link with no name would otherwise slide every later url up a slot, which is the
+      # same null-padding trap the owner lists carry.
+      LinkUrls     = GetAttributeValuesAligned $attributes "Links.URL"
+      LinkNames    = GetAttributeValuesAligned $attributes "Links.Name"
+
+      # Attachments: the oids to download and the filenames to give ADO. Aligned for the same reason
+      # as the owner and link lists - an attachment with no filename must not slide the rest up a slot.
+      AttachmentOids  = GetRelationValuesAligned  $attributes "Attachments"
+      AttachmentNames = GetAttributeValuesAligned $attributes "Attachments.Filename"
 
       # The Agility creator, used as the assignee when the item has no owner. Often current staff and
       # therefore assignable where a departed owner would not be. See ResolveAssignee.
@@ -1205,6 +1403,19 @@ function GetAttributeValues($attributes, [string]$name)
   if ($null -eq $value) { return @() }
 
   return @($value | Where-Object { $_ })
+}
+
+# A multi value RELATION read aligned: each entry mapped to its idref, empty slots kept. Relations
+# arrive as objects rather than scalars, so GetAttributeValuesAligned alone yields the wrapper.
+function GetRelationValuesAligned($attributes, [string]$name)
+{
+  $values = @(GetAttributeValuesAligned $attributes $name)
+
+  return @($values | ForEach-Object {
+    if ($null -eq $_) { $null }
+    elseif ($_ -is [psobject] -and $_.PSObject.Properties['idref']) { $_.idref }
+    else { "$_" }
+  })
 }
 
 # The same list with the empty slots KEPT, so index i means the same thing in two lists read off the
@@ -1484,6 +1695,50 @@ function ResolveBlockedIds($item, $existing)
   }
 }
 
+# The ADO ids for the Epics this one depends on and the Epics that depend on it, plus the Agility
+# numbers that had no ADO item to point at.
+#
+# Both ends are read, and that is deliberate rather than redundant. Agility.Dependencies and
+# Agility.Dependants are the two sides of ONE relationship, and ADO creates the reverse link for you.
+# Within a run only one side can ever resolve: when the first Epic of a pair is created its partner
+# is not in the map yet and is skipped, and when the partner is created the first one IS in the map,
+# so the pair is written exactly once, from whichever side comes second. On a rerun both are skipped
+# as already migrated, so nothing is duplicated either.
+#
+# An unresolved number is an Epic outside the configured scopes, and keeps its number as a tag the
+# same way an unmigrated parent does.
+function ResolveDependencyIds($item, $existing)
+{
+  $successors = @()
+  $predecessors = @()
+  $unresolved = @()
+
+  foreach ($pair in @(
+    @{ Numbers = @($item.DependencyNumbers); Into = 'successor' },
+    @{ Numbers = @($item.DependantNumbers);  Into = 'predecessor' }))
+  {
+    foreach ($number in $pair.Numbers)
+    {
+      if (-not $number) { continue }
+
+      if (-not $existing.ContainsKey($number)) { $unresolved += $number; continue }
+
+      # A dry run creates nothing, so an id it only pencilled in is not a real link target. It is
+      # not a miss either: a real run would have made it, so it is neither reported nor written.
+      if ($existing[$number] -eq $script:DryRunPendingId) { continue }
+
+      if ($pair.Into -eq 'successor') { $successors += $existing[$number] }
+      else                            { $predecessors += $existing[$number] }
+    }
+  }
+
+  return [pscustomobject]@{
+    Successors   = @($successors | Select-Object -Unique)
+    Predecessors = @($predecessors | Select-Object -Unique)
+    Unresolved   = @($unresolved | Select-Object -Unique)
+  }
+}
+
 # Maps an Agility oid to the ADO id it was migrated as, or $null if it is not in ADO yet. Both
 # the hierarchy parent and the true parent resolve through here.
 function ResolveMigratedId($oid, $existing)
@@ -1496,6 +1751,15 @@ function ResolveMigratedId($oid, $existing)
   if ($existing.ContainsKey($number)) { return $existing[$number] }
 
   return $null
+}
+
+# One created item, counted, plus whether it was archived rather than closed. The dry run and the real
+# path both go through here, so the summary's Removed count means the same thing in either.
+function RecordCreated($epic)
+{
+  $script:created++
+
+  if (IsStaleAdoState $epic (MapState $epic)) { $script:removed++ }
 }
 
 function MigrateItem($epic, $existing)
@@ -1556,6 +1820,16 @@ function MigrateItem($epic, $existing)
     $script:warnings++
   }
 
+  # Epic to Epic dependencies, same shape: resolved up front so the dry run and the real run agree.
+  $dependencies = ResolveDependencyIds $epic $existing
+  $epic | Add-Member -NotePropertyName DependencyUnresolved -NotePropertyValue $dependencies.Unresolved -Force
+
+  if ($dependencies.Unresolved.Count -gt 0)
+  {
+    WriteLog "  WARN    $($epic.Number) depends on $($dependencies.Unresolved -join ', '), which are not in Azure DevOps, keeping them as tags" Yellow
+    $script:warnings++
+  }
+
   if ($script:DryRun)
   {
     # Report the real link, not just the Agility number.
@@ -1582,7 +1856,11 @@ function MigrateItem($epic, $existing)
     $resolved = ResolveAssignee $epic
     $assignee = if ($resolved) { " assignee=$resolved" } else { "" }
 
-    WriteLog "  WOULD   $($epic.AdoType.PadRight(8)) $($epic.Number) $titleText [$parentText$relatedText$blocksText] area=$(FormatAreaPath $epic.AreaPath) state=$(MapState $epic) priority=$(MapPriority $epic.Priority)$assignee"
+    # Say how many files a real run would copy. Nothing is downloaded to work this out.
+    $attachmentCount = @(@($epic.AttachmentOids) | Where-Object { $_ }).Count
+    $attachmentText = if ($attachmentCount -gt 0) { " attachments=$attachmentCount" } else { "" }
+
+    WriteLog "  WOULD   $($epic.AdoType.PadRight(8)) $($epic.Number) $titleText [$parentText$relatedText$blocksText] area=$(FormatAreaPath $epic.AreaPath) state=$(MapState $epic) priority=$(MapPriority $epic.Priority)$assignee$attachmentText"
 
     # Ask ADO whether it would actually accept these fields. Nothing is persisted.
     $problem = ValidateAdoWorkItem $epic
@@ -1598,7 +1876,7 @@ function MigrateItem($epic, $existing)
         WriteLog "  WARN    $($epic.Number) owner '$resolved' is not an Azure DevOps identity, would be created unassigned" Yellow
         $script:warnings++
         $existing[$key] = $script:DryRunPendingId
-        $script:created++
+        RecordCreated $epic
         return
       }
 
@@ -1618,7 +1896,7 @@ function MigrateItem($epic, $existing)
     # would make as misses. An INVALID item deliberately does not get one: a real run would not
     # create it either, so nothing should link to it.
     $existing[$key] = $script:DryRunPendingId
-    $script:created++
+    RecordCreated $epic
     return
   }
 
@@ -1629,6 +1907,9 @@ function MigrateItem($epic, $existing)
     # identity to reject: the create no longer needs the old unassigned retry.
     $id = NewAdoWorkItem $epic $parentId $trueParentId $blocked.Ids
     $existing[$key] = $id
+
+    # Dependency links, now that the item exists and a cyclic one can only cost itself.
+    AddAdoDependencyLinks $id $epic $dependencies
 
     # Revision 2: the state transition, backdated and attributed to the last changer. Only when the
     # mapped state differs from the create-time default, so an item that never left its default state
@@ -1658,12 +1939,23 @@ function MigrateItem($epic, $existing)
       else { throw }
     }
 
+    # Who closed it is NOT patched here. Closed By is read only under process rules, so any patch of
+    # it is rejected with TF401320 whatever the item's state - which failed 161 Epics on the first
+    # real run, after they had already been created. It rides in the bypassRules create instead.
+
+    # The files themselves, downloaded from Agility and uploaded to ADO. Last, and non fatal: the
+    # item exists by now, so a file that will not move must not undo it.
+    AddAdoAttachments $id $epic
+
+    # Where this item came from, as a Discussion entry dated today. Also non fatal.
+    AddAdoMigrationComment $id $epic
+
     # The Closed Date is written inside SetAdoState (the closing transition), not here: it must be set
     # BEFORE the rule-checked assignee patch above, or that patch rejects a closed item with an empty
     # Closed Date. bypassRules never auto-stamps a fake date, so there is nothing left to correct.
 
     WriteLog "  CREATE  $($epic.AdoType.PadRight(8)) $($epic.Number) $($epic.Name) -> #$id" Green
-    $script:created++
+    RecordCreated $epic
   }
   catch
   {
@@ -1885,6 +2177,29 @@ function MapFieldValue([string]$mapName, [string]$raw, $item)
   return $null
 }
 
+# Every fiscal year on an item, and every mandate. Both are multi value in Agility and were read as
+# scalars until 2026-07-30, so both properties exist: the list is the truth, and the old scalar is the
+# fallback for any caller (or fixture) that only sets one.
+function FiscalYearValues($item)
+{
+  $values = @($item.FiscalYears) | Where-Object { $_ }
+  if ($values.Count -gt 0) { return $values }
+
+  if ($item.FiscalYear) { return @($item.FiscalYear) }
+
+  return @()
+}
+
+function MandateValues($item)
+{
+  $values = @($item.Mandates) | Where-Object { $_ }
+  if ($values.Count -gt 0) { return $values }
+
+  if ($item.Mandate) { return @($item.Mandate) }
+
+  return @()
+}
+
 # The Custom.DigitalAI* field definition (Field + AdoTypes) for a logical name, or $null if the name
 # is unknown. Paired with TypeHasCustomField so a field is written and asserted for exactly the ADO
 # types it exists on.
@@ -1910,6 +2225,83 @@ function BuildAssigneeOp($epic)
   $assignee = ResolveAssignee $epic
   if (-not $assignee) { return $null }
   return @{ op = "add"; path = "/fields/System.AssignedTo"; value = $assignee }
+}
+
+# Whether ADO's Hyperlink relation can actually take this location. Only http and https: of the 5
+# Epics carrying a Link, 3 are https and 2 are I:\ file share paths, which are not URLs ADO accepts.
+# The unlinkable ones go into the description instead of being dropped.
+function IsHyperlinkable([string]$url)
+{
+  if (-not $url) { return $false }
+
+  return [bool]($url -match '^https?://')
+}
+
+# The Hyperlink relation ops for an item's Agility Links. The name rides along as the link comment,
+# which is what ADO shows in the Links tab.
+function BuildHyperlinkOps($epic)
+{
+  $ops = @()
+  $urls = @($epic.LinkUrls)
+  $names = @($epic.LinkNames)
+
+  for ($i = 0; $i -lt $urls.Count; $i++)
+  {
+    if (-not (IsHyperlinkable $urls[$i])) { continue }
+
+    $comment = if ($i -lt $names.Count -and $names[$i]) { $names[$i] } else { "Agility link" }
+    $ops += @{
+      op    = "add"
+      path  = "/relations/-"
+      value = @{ rel = "Hyperlink"; url = $urls[$i]; attributes = @{ comment = $comment } }
+    }
+  }
+
+  return $ops
+}
+
+# Who closed the Epic, for Microsoft.VSTS.Common.ClosedBy: email first, then display name, and only
+# if ADO will actually accept the identity.
+#
+# UNLIKE the history people (CreatedBy / ChangedBy), this one IS filtered for assignability, because
+# it is written in a rule-checked patch rather than under bypassRules. That is deliberate: bypass
+# skips identity validation and would store a departed closer as an unresolvable historical identity,
+# which is the same hazard that keeps System.AssignedTo off the bypass create. 406 of the 773 Epics
+# with a closer name someone ADO will not accept (Brittney Trimmer alone closed 311), and those items
+# simply keep an empty Closed By rather than a broken one.
+function ResolveClosedBy($epic)
+{
+  foreach ($candidate in @($epic.ClosedByEmail, $epic.ClosedByName))
+  {
+    if (-not $candidate) { continue }
+    if (IsAssignableIdentity $candidate) { return $candidate }
+  }
+
+  return $null
+}
+
+# The Closed By op, or $null when there is nobody usable. It belongs to the bypassRules CREATE and
+# nowhere else, for two separately verified reasons:
+#
+#   1. Closed By is READ ONLY under process rules. A rule-checked patch is rejected outright with
+#      TF401320 "ReadOnly, AllowsOldValue, InvalidNotOldValue", whatever state the item is in. That is
+#      what failed 161 Epics on the first real run: each was created, transitioned and assigned, and
+#      only then died on this one field, leaving a work item behind that a rerun would skip.
+#   2. A rule-checked validateOnly rejects it too ("AllowsOldValue, InvalidNotEmpty"), so it must stay
+#      OUT of BuildFieldPatch, which the dry run validates. In the bypass create it is invisible to
+#      that validation, exactly like the backdated history headers.
+#
+# Verified live: written on the create, it survives the later bypass transition AND the rule-checked
+# assignee patch that follows, on both Done and Removed.
+#
+# bypass skips identity validation, so ResolveClosedBy's assignability filter is the ONLY thing
+# keeping a departed closer from being stored as an unresolvable historical identity. Do not remove it.
+function BuildClosedByOp($epic)
+{
+  $closedBy = ResolveClosedBy $epic
+  if (-not $closedBy) { return $null }
+
+  return @{ op = "add"; path = "/fields/$($script:mappings.Fields.ClosedBy)"; value = $closedBy }
 }
 
 # The identity string for a history person (creator or last changer): email first, then display name,
@@ -2021,7 +2413,10 @@ function BuildFieldPatch($epic)
   $category = if ($epic.Category) { $epic.Category } else { "" }
   $patch += @{ op = "add"; path = "/fields/$($script:mappings.RequiredFields.AgilityCategory)"; value = $category }
 
-  $fiscalYear = if ($epic.FiscalYear) { $epic.FiscalYear } else { "" }
+  # EVERY fiscal year, not just the first: 42 of 114 Epics carry more than one and 59 values were
+  # being dropped. The field is free text (verified against the live field definition), so a joined
+  # list persists exactly as sent.
+  $fiscalYear = (@(FiscalYearValues $epic) | Where-Object { $_ }) -join '; '
   $patch += @{ op = "add"; path = "/fields/$($script:mappings.RequiredFields.AgilityFY)"; value = $fiscalYear }
 
   # ---- Custom.DigitalAI* fields that live on only some work item types ----
@@ -2047,11 +2442,12 @@ function BuildFieldPatch($epic)
     if ($team) { $patch += @{ op = "add"; path = "/fields/$($teamDef.Field)"; value = $team } }
   }
 
-  # Mandate. Epic ONLY, so a nested Agility Epic (which becomes a Feature) has no field for it.
+  # Mandate, Epic and Feature. Multi value in Agility (2 Epics carry two), so the whole list goes.
   $mandateDef = CustomFieldDef 'Mandate'
-  if ((TypeHasCustomField $mandateDef $adoType) -and $epic.Mandate)
+  if (TypeHasCustomField $mandateDef $adoType)
   {
-    $patch += @{ op = "add"; path = "/fields/$($mandateDef.Field)"; value = $epic.Mandate }
+    $mandate = (@(MandateValues $epic) | Where-Object { $_ }) -join '; '
+    if ($mandate) { $patch += @{ op = "add"; path = "/fields/$($mandateDef.Field)"; value = $mandate } }
   }
 
   # Strategic theme (Epic and Feature only): the themes that fit the DevLabs control's 255 char field,
@@ -2083,6 +2479,16 @@ function BuildFieldPatch($epic)
     {
       $patch += @{ op = "add"; path = "/fields/$($impResDef.Field)"; value = $epic.ResolutionReason }
     }
+  }
+
+  # Acceptance criteria, cloned out of the description prose into the real field. Agility has no
+  # acceptance criteria attribute anywhere, so this is the only way to populate it. Gated on the ADO
+  # type because Task and Impediment have no such field and would drop the write silently.
+  $acDef = CustomFieldDef 'AcceptanceCriteria'
+  if (TypeHasCustomField $acDef $adoType)
+  {
+    $criteria = ExtractAcceptanceCriteria $epic.Description
+    if ($criteria) { $patch += @{ op = "add"; path = "/fields/$($acDef.Field)"; value = $criteria } }
   }
 
   # Tags come after, because BuildTags no longer carries the Number, the Status, the Category or the
@@ -2180,6 +2586,11 @@ function NewAdoWorkItem($epic, $parentId, $trueParentId, $blockedIds)
   # rules. Empty when there is no history data, leaving ADO's own create stamp.
   $patch += BuildHistoryHeaderOps $epic
 
+  # Who closed it. Also bypass-only: Closed By is read only under process rules, so this is the one
+  # payload that can carry it. See BuildClosedByOp for what that costs and why it is safe.
+  $closedByOp = BuildClosedByOp $epic
+  if ($closedByOp) { $patch += $closedByOp }
+
   if ($parentId)
   {
     $patch += @{
@@ -2210,6 +2621,14 @@ function NewAdoWorkItem($epic, $parentId, $trueParentId, $blockedIds)
       }
     }
   }
+
+  # Dependency links are deliberately NOT here. Agility allows cycles in a dependency graph and ADO
+  # does not, so a cyclic link inside this payload makes ADO reject the entire create with TF201035
+  # and the work item is never made - it cost 4 Stories on the 2026-07-31 run. They are added by
+  # AddAdoDependencyLinks once the item exists, where a bad link costs only itself.
+
+  # Agility Links that are real URLs become ADO hyperlinks; the rest are in the description.
+  $patch += BuildHyperlinkOps $epic
 
   # A flattened Epic hangs off the root rather than its real parent, so record the real parent as
   # a Related link. Hierarchy-Reverse would be the honest link type, but it is exactly the same
@@ -2286,10 +2705,18 @@ function SetAdoState([int]$id, [string]$state, $epic)
     # created) date, since it cannot be left empty. Other closed types allow an empty Closed Date, so
     # they get one only when Agility actually has it (an empty one is the correct "no real date" state,
     # and bypass never auto-stamps a fake one).
-    if (IsClosedAdoState $epic $state)
+    # The stale state counts here too. An item archived into Removed still finished on a real day, and
+    # Removed accepts a Closed Date on every type - verified live on Epic, Product Backlog Item, Bug
+    # and Task: a bypass transition to Removed carrying a date passed, the date read back, and the
+    # rule-checked patch that follows passed. So the real date rides along rather than being dropped.
+    if ((IsClosedAdoState $epic $state) -or (IsStaleAdoState $epic $state))
     {
       $closed = FormatDate $epic.ClosedDate
-      if (-not $closed -and $epic.AgilityType -eq 'Task')
+
+      # Task's Done REQUIRES a non-empty Closed Date, so a closed Task with no Agility date falls back
+      # rather than failing. Removed requires one on NO type (same probe), so an archived item with no
+      # real date keeps an empty one instead of a fabricated one.
+      if (-not $closed -and $epic.AgilityType -eq 'Task' -and (IsClosedAdoState $epic $state))
       {
         $closed = FormatDate $epic.ChangeDate
         if (-not $closed) { $closed = FormatDate $epic.CreateDate }
@@ -2317,6 +2744,219 @@ function SetAdoAssignee([int]$id, $epic)
     $script:config.AzureDevOps.OrganizationUrl.TrimEnd('/'), $id
 
   InvokeAdoRequest $url "Patch" @($op) "application/json-patch+json" | Out-Null
+}
+
+
+# ADO refuses a Dependency link that would close a cycle. Agility has no such rule, so its data does
+# contain cycles and this is expected data, not a fault.
+function IsCircularLinkProblem([string]$message)
+{
+  return ($message -match 'TF201035' -or $message -match 'circular relationship')
+}
+
+# The Successor and Predecessor links for one item, added AFTER it exists.
+#
+# Not in the create, and that is the whole point: ADO rejects the entire create when a link in it
+# would close a cycle (TF201035), so a single bad dependency used to cost the whole work item - it
+# lost 4 Stories before this was split out. Here the item is already safe, so a rejected link costs
+# only itself.
+#
+# One batched call in the common case, because there are ~3,800 items with dependencies and a call
+# per link would be nearer 10,000. Only when the batch is rejected is each link retried alone, which
+# isolates the genuinely cyclic one and keeps the rest: on the 2026-07-31 data 4 items out of ~3,600
+# had a cycle, so the slow path is rare.
+function AddAdoDependencyLinks([int]$id, $epic, $dependencies)
+{
+  if ($script:DryRun) { return }
+
+  $ops = @()
+  foreach ($successorId in @($dependencies.Successors))
+  {
+    $ops += @{
+      op    = "add"
+      path  = "/relations/-"
+      value = @{
+        rel        = ($script:mappings.LinkTypes.Successor)
+        url        = (AdoWorkItemUrl $successorId)
+        attributes = @{ comment = "Agility dependency of $($epic.Number)." }
+      }
+    }
+  }
+  foreach ($predecessorId in @($dependencies.Predecessors))
+  {
+    $ops += @{
+      op    = "add"
+      path  = "/relations/-"
+      value = @{
+        rel        = ($script:mappings.LinkTypes.Predecessor)
+        url        = (AdoWorkItemUrl $predecessorId)
+        attributes = @{ comment = "Agility dependant of $($epic.Number)." }
+      }
+    }
+  }
+  if ($ops.Count -eq 0) { return }
+
+  $url = "{0}/_apis/wit/workitems/{1}?api-version=7.1" -f `
+    $script:config.AzureDevOps.OrganizationUrl.TrimEnd('/'), $id
+
+  try
+  {
+    InvokeAdoRequest $url "Patch" $ops "application/json-patch+json" | Out-Null
+    return
+  }
+  catch
+  {
+    # One link in the batch was refused, and the batch is all-or-nothing. Retry them individually so
+    # the refusal costs one link rather than all of this item's links.
+    WriteLogDetail "  dependency batch for $($epic.Number) rejected, retrying $($ops.Count) links individually: $(ReadAdoError $_)"
+  }
+
+  foreach ($op in $ops)
+  {
+    try { InvokeAdoRequest $url "Patch" @($op) "application/json-patch+json" | Out-Null }
+    catch
+    {
+      $target = ($op.value.url -split '/')[-1]
+      $reason = if (IsCircularLinkProblem (ReadAdoError $_)) { "it would close a dependency cycle, which Agility allows and Azure DevOps does not" }
+                else { ReadAdoError $_ }
+      WriteLog "  WARN    $($epic.Number) dependency link to #$target was not created - $reason" Yellow
+      WriteErrorDetail $_ "dependency link $($epic.Number) -> #$target"
+      $script:warnings++
+    }
+  }
+}
+
+# Adds the migration note to the work item's Discussion.
+#
+# System.History IS the discussion entry in ADO; patching it appends a comment. Deliberately its own
+# call, rule-checked and carrying NO ChangedDate, so the comment lands at the moment of migration
+# rather than being dragged back to the Agility date the way the create and the state transition are.
+# The item's rev 1 and rev 2 keep their real backdated dates and people either way, because this only
+# ever adds a revision on the end - which the rule-checked assignee patch already does.
+#
+# Bookkeeping, not content: the work item exists by the time this runs, so a failure warns and moves
+# on rather than failing an item that is otherwise complete.
+function AddAdoMigrationComment([int]$id, $epic)
+{
+  if ($script:DryRun) { return }
+
+  $note = BuildMigrationNote $epic
+  if (-not $note) { return }
+
+  $url = "{0}/_apis/wit/workitems/{1}?api-version=7.1" -f `
+    $script:config.AzureDevOps.OrganizationUrl.TrimEnd('/'), $id
+
+  try
+  {
+    InvokeAdoRequest $url "Patch" @(
+      @{ op = "add"; path = "/fields/System.History"; value = $note }
+    ) "application/json-patch+json" | Out-Null
+  }
+  catch
+  {
+    WriteLog "  WARN    $($epic.Number) could not add the migration comment - $(ReadAdoError $_)" Yellow
+    WriteErrorDetail $_ "migration comment for $($epic.Number)"
+    $script:warnings++
+  }
+}
+
+##################################################################################################
+# Attachments
+#
+# Agility keeps the file itself behind attachment.img/{numericId}; the work item only holds oids. So
+# each file is DOWNLOADED from Agility and UPLOADED to Azure DevOps, then linked as an AttachedFile
+# relation. There is no way to reference the Agility copy instead: it needs an Agility login.
+#
+# Everything here is deliberately non fatal. By the time attachments are copied the work item exists,
+# and a file that will not move is worth a warning, not the loss of the item. Each file is handled on
+# its own, so one bad download does not cost an item its other files.
+##################################################################################################
+
+# A raw binary POST. Separate from InvokeAdoRequest because that one serialises its body as JSON,
+# which would corrupt a file.
+function InvokeAdoUpload([string]$url, $bytes)
+{
+  return InvokeWithRetry {
+    Invoke-RestMethod -Uri $url -Method Post -Headers $script:adoHeaders `
+      -Body $bytes -ContentType "application/octet-stream" -ErrorAction Stop
+  }
+}
+
+# Uploads one file to the project's attachment store and returns the url that identifies it. The name
+# in the query string is what ADO shows on the work item.
+function NewAdoAttachment([string]$fileName, $bytes)
+{
+  $url = "{0}/{1}/_apis/wit/attachments?fileName={2}&api-version=7.1" -f `
+    $script:config.AzureDevOps.OrganizationUrl.TrimEnd('/'),
+    [uri]::EscapeDataString($script:config.AzureDevOps.Project),
+    [uri]::EscapeDataString($fileName)
+
+  return (InvokeAdoUpload $url $bytes).url
+}
+
+# Copies every attachment on an Agility item onto the ADO work item it became.
+function AddAdoAttachments([int]$id, $epic)
+{
+  # A dry run writes nothing, and there is no reason to spend the bandwidth downloading either.
+  if ($script:DryRun) { return }
+
+  $oids = @($epic.AttachmentOids)
+  if ($oids.Count -eq 0) { return }
+
+  $names = @($epic.AttachmentNames)
+
+  for ($i = 0; $i -lt $oids.Count; $i++)
+  {
+    $oid = $oids[$i]
+    if (-not $oid) { continue }
+
+    # Agility does not guarantee a filename. ADO needs one, so fall back to the attachment's own id
+    # rather than skipping a file that is otherwise fine.
+    $fileName = if ($i -lt $names.Count -and $names[$i]) { $names[$i] } else { "agility-attachment-$(AgilityAttachmentId $oid)" }
+
+    try
+    {
+      $bytes = GetAgilityAttachmentBytes $oid
+      if ($null -eq $bytes -or $bytes.Length -eq 0)
+      {
+        throw "the download returned no content"
+      }
+
+      if ($bytes.Length -gt $script:AttachmentMaxBytes)
+      {
+        WriteLog "  WARN    $($epic.Number) attachment '$fileName' is $([int]($bytes.Length/1MB)) MB, over the $([int]($script:AttachmentMaxBytes/1MB)) MB limit, skipping it" Yellow
+        $script:warnings++
+        $script:attachmentsFailed++
+        continue
+      }
+
+      $attachmentUrl = NewAdoAttachment $fileName $bytes
+
+      $patchUrl = "{0}/_apis/wit/workitems/{1}?api-version=7.1" -f `
+        $script:config.AzureDevOps.OrganizationUrl.TrimEnd('/'), $id
+
+      InvokeAdoRequest $patchUrl "Patch" @(
+        @{
+          op    = "add"
+          path  = "/relations/-"
+          value = @{
+            rel        = "AttachedFile"
+            url        = $attachmentUrl
+            attributes = @{ comment = "Migrated from digital.ai Agility $($epic.Number)." }
+          }
+        }
+      ) "application/json-patch+json" | Out-Null
+
+      $script:attachmentsCopied++
+    }
+    catch
+    {
+      WriteLog "  WARN    $($epic.Number) attachment '$fileName' could not be copied - $(ReadAdoError $_)" Yellow
+      WriteErrorDetail $_ "attachment $oid ('$fileName') for $($epic.Number)"
+      $script:warnings++
+      $script:attachmentsFailed++
+    }
+  }
 }
 
 # Rewrites Custom.DigitalAIOwners after an assignee was rejected: the create excluded the would-be
@@ -2374,22 +3014,131 @@ function BuildDescription($epic, $themeInfo)
     $description += "<hr /><p><b>Strategic Themes:</b> " + [System.Net.WebUtility]::HtmlEncode(($themeInfo.All -join '; ')) + "</p>"
   }
 
+  # An Agility Link that ADO's Hyperlink relation cannot take. 2 of the 5 are I:\ file share paths,
+  # which are real locations to a person and not URLs to ADO, so they are written here rather than
+  # dropped. A link that DID become a hyperlink is not repeated here.
+  $unlinkable = @()
+  $urls = @($epic.LinkUrls)
+  $names = @($epic.LinkNames)
+  for ($i = 0; $i -lt $urls.Count; $i++)
+  {
+    if (-not $urls[$i] -or (IsHyperlinkable $urls[$i])) { continue }
+
+    $label = if ($i -lt $names.Count -and $names[$i]) { $names[$i] } else { "Link" }
+    $unlinkable += "$($label): $($urls[$i])"
+  }
+  if ($unlinkable.Count -gt 0)
+  {
+    $encoded = $unlinkable | ForEach-Object { [System.Net.WebUtility]::HtmlEncode($_) }
+    $description += "<hr /><p><b>Agility links</b><br />" + ($encoded -join "<br />") + "</p>"
+  }
+
   # The Agility metadata block, now just the Sprint (Timebox) line: owners, team, mandate, strategic
   # theme and resolution reason became Custom.DigitalAI* fields, and source became a tag again.
   $description += BuildAgilityDetails $epic
 
-  $footer = "<hr /><p><i>Migrated from digital.ai Agility $($epic.Number)"
+  # No migration footer. Where the item came from is provenance, not content, so it goes to the
+  # Discussion as a comment dated the day of the migration (see BuildMigrationNote). The description
+  # therefore carries only the item's own material, and is empty when Agility had nothing to say.
+  return $description
+}
+
+# The Discussion entry each migrated item gets: where it came from, and the structural note if its
+# hierarchy had to be flattened to fit ADO's two portfolio levels.
+function BuildMigrationNote($epic)
+{
+  $note = "Migrated from digital.ai Agility $($epic.Number)"
 
   if ($epic.Flattened -and $epic.TrueParentOid)
   {
     $parentNumber = $script:numberByOid[$epic.TrueParentOid]
     if ($parentNumber)
     {
-      $footer += ". Agility parent: $parentNumber, flattened to the top level Epic because Azure DevOps has only two portfolio levels"
+      $note += ". Agility parent: $parentNumber, flattened to the top level Epic because Azure DevOps has only two portfolio levels"
     }
   }
 
-  return $description + $footer + "</i></p>"
+  return $note
+}
+
+##################################################################################################
+# Acceptance criteria, cloned out of the description into the real ADO field
+#
+# Agility has NO acceptance criteria attribute of any kind, on any type. What it has is people
+# writing the criteria into the description under a heading, which is why this is parsed out of
+# prose rather than mapped from a field.
+#
+# The shapes below are measured, not assumed. Across all 619 Epic descriptions:
+#   - 100 carry an "Acceptance Criteria" heading, spelled that way EVERY time. Case varies and the
+#     trailing colon is optional. There are no misspellings.
+#   - The heading is <p><strong>...</strong></p> on 60, a plain <p> on 35, and inline on the rest.
+#   - 35 are followed by a "Constraints" heading, which is what has to bound the section; the other
+#     65 run to the end of the description.
+#   - "A/C", "Definition of Done" and "DoD" appear ZERO times.
+#   - "AC" appears standalone exactly twice in the whole corpus, and BOTH are prose about student
+#     record lines ("their file stays at AC", "no MS or AC line"). Matching a bare AC would be two
+#     false positives and no true ones, so AC is honoured only in HEADING position: preceded by a
+#     block tag and followed by a colon. Both known false positives fail that test on two counts.
+#
+# The criteria are CLONED, not moved: the text stays in the description as well, by request.
+##################################################################################################
+
+# The heading, spelled out. Case insensitive, colon optional, and it swallows whatever block and
+# emphasis tags wrap it so the caller is left with the section body alone.
+$script:AcHeadingSpelled = '(?is)(?:<(?:p|h[1-6]|div|li)[^>]*>\s*)?(?:<(?:strong|b|em|u|span)[^>]*>\s*)*acceptance\s*criteri\w*\s*:?\s*(?:</(?:strong|b|em|u|span)>\s*)*(?:</(?:p|h[1-6]|div)>\s*)?'
+
+# The abbreviation. Case SENSITIVE, and it requires both a block tag in front and a colon after, so
+# "AC" inside a sentence can never match. Note there is no (?i) here, deliberately.
+$script:AcHeadingShort = '(?s)<(?:p|h[1-6]|div|li)[^>]*>\s*(?:<(?:strong|b|em|u|span)[^>]*>\s*)*AC\s*:\s*(?:</(?:strong|b|em|u|span)>\s*)*(?:</(?:p|h[1-6]|div)>\s*)?'
+
+# What ends the section. Three shapes, all measured:
+#   - a real heading element
+#   - a paragraph that is nothing but short BOLD text, colon optional: "<p><strong>Constraints</strong></p>",
+#     which is how 24 of them are written
+#   - a paragraph that is nothing but short PLAIN text ending in a colon: "<p>Constraints:</p>". The
+#     colon is REQUIRED here, or any short paragraph would end the section.
+#
+# The plain form matters: without it, "Constraints" leaked INTO the acceptance criteria on 13 Epics.
+# Checked against every short colon-terminated paragraph inside the 100 real sections, and they are
+# all sub-headings: Constraints (13), NOTES (3), Contrainsts (a misspelling), Additional Information,
+# Group, and "Emeritus benefits include:", which introduces a benefits list rather than criteria.
+$script:AcSectionEnd = '(?is)<h[1-6][^>]*>' +
+                       '|<p[^>]*>\s*<(?:strong|b)[^>]*>[^<]{2,80}</(?:strong|b)>\s*:?\s*</p>' +
+                       '|<p[^>]*>\s*[^<>]{1,60}:\s*</p>'
+
+# The acceptance criteria section of a description, as an HTML fragment, or $null when there is none.
+function ExtractAcceptanceCriteria([string]$html)
+{
+  if (-not $html) { return $null }
+
+  # Spelled out first: it is the only form that actually occurs, and requiring the abbreviation to
+  # look like a heading means the two can never disagree about the same text.
+  $heading = [regex]::Match($html, $script:AcHeadingSpelled)
+  if (-not $heading.Success) { $heading = [regex]::Match($html, $script:AcHeadingShort) }
+  if (-not $heading.Success) { return $null }
+
+  $section = $html.Substring($heading.Index + $heading.Length)
+
+  # Everything up to the next heading belongs to the criteria; everything after it does not.
+  $end = [regex]::Match($section, $script:AcSectionEnd)
+  if ($end.Success) { $section = $section.Substring(0, $end.Index) }
+
+  # A heading written inside a list item leaves the slice starting part way out of that list, so the
+  # section opens with closing tags it never opened. A section can never legitimately begin by
+  # closing something, so a leading run of them is always orphaned and always safe to drop.
+  $section = [regex]::Replace($section, '(?is)^(?:\s*</(?:li|ul|ol|p|div|strong|b|em|u|span|td|tr|table)>)+', '')
+
+  # Trailing spacer paragraphs are noise the editor left behind, not criteria.
+  $section = [regex]::Replace($section, '(?is)(?:<p[^>]*>(?:\s|&nbsp;|<br\s*/?>)*</p>\s*)+$', '')
+  $section = $section.Trim()
+
+  # A heading with nothing under it must not write an empty field. Judge that on the TEXT, not the
+  # markup: "<p><br></p>" is several characters of nothing.
+  $text = [regex]::Replace($section, '(?s)<[^>]+>', '')
+  $text = ($text -replace '&nbsp;', ' ').Trim()
+  if (-not $text) { return $null }
+
+  return $section
 }
 
 # The block of Agility metadata appended to the description by BuildDescription. On 2026-07-17 the
@@ -2402,6 +3151,15 @@ function BuildAgilityDetails($item)
   $lines = @()
 
   if ($item.Timebox) { $lines += "Sprint: $($item.Timebox)" }
+
+  # The four Epic attributes with no ADO field. The user chose this block over four new custom fields
+  # on 2026-07-30, so this is where they live. Personas is multi value; the rest are scalars, and
+  # Risk is a number so it is tested against $null rather than truthiness (0 is a real rating).
+  $personas = @($item.Personas) | Where-Object { $_ }
+  if ($personas.Count -gt 0)   { $lines += "Personas: $($personas -join ', ')" }
+  if ($null -ne $item.Risk -and "$($item.Risk)" -ne "") { $lines += "Risk: $($item.Risk)" }
+  if ($item.Reference)         { $lines += "Reference: $($item.Reference)" }
+  if ($item.RequestedBy)       { $lines += "Requested by: $($item.RequestedBy)" }
 
   if ($lines.Count -eq 0) { return "" }
 
@@ -2433,8 +3191,23 @@ function BuildTags($item)
     if ($number) { $tags += "agility-blocks:$number" }
   }
 
-  # Source is Defect only (23 of 706 carry one). A tag, not a field, by request.
+  # An Epic dependency whose other end is outside the configured scopes: the link cannot be made, so
+  # the number stays, same rule as the parent and the blocked items.
+  foreach ($number in @($item.DependencyUnresolved))
+  {
+    if ($number) { $tags += "agility-depends:$number" }
+  }
+
+  # Source, on Defect (23 of 706) and Epic (93 of 877). A tag, not a field, by request. Epic's
+  # selection did not ask for it until the 2026-07-30 field audit, so those 93 were being dropped.
   if ($item.Source) { $tags += "agility-source:$($item.Source)" }
+
+  # Agility's own tag list. 27 Epics carry one, up to 5 tags each, and System.Tags is the obvious
+  # home since the tool already writes it.
+  foreach ($tag in @($item.AgilityTags))
+  {
+    if ($tag) { $tags += $tag }
+  }
 
   return (($tags | ForEach-Object { $_ -replace ';', ',' }) -join '; ')
 }
@@ -2443,16 +3216,51 @@ function BuildTags($item)
 # area path. Theme names do not match the ADO node names (Applications vs Apps), so the map in
 # mappings.json translates them. A Theme with no entry, or an item with no Theme, stays at the
 # scope's area path rather than inventing a node that does not exist.
-function ResolveAreaPath([string]$scopeAreaPath, [string]$theme)
+function ResolveAreaPath([string]$scopeAreaPath, [string]$theme, [string]$team)
 {
-  if (-not $theme) { return $scopeAreaPath }
+  # The scope is the strongest evidence, then the Theme. The Team is only consulted when those two
+  # would leave the item at the project root, which is what makes it a fallback rather than a rule.
+  # Only replaced when the team actually resolves, so an unmapped team returns the scope's own value
+  # unchanged rather than turning an empty string into $null.
+  $base = $scopeAreaPath
+  if (-not $base)
+  {
+    $fromTeam = ResolveTeamAreaPath $team
+    if ($fromTeam) { $base = $fromTeam }
+  }
+
+  if (-not $theme) { return $base }
 
   $leaf = $script:mappings.ThemeAreaPaths.PSObject.Properties[$theme]
-  if (-not $leaf) { return $scopeAreaPath }
+  if (-not $leaf) { return $base }
 
-  if (-not $scopeAreaPath) { return $leaf.Value }
+  if (-not $base) { return $leaf.Value }
 
-  return "$scopeAreaPath\$($leaf.Value)"
+  return "$base\$($leaf.Value)"
+}
+
+# The area path a Team implies, or $null when the map has no entry for it.
+#
+# Used ONLY when an item would otherwise land at the project root. One scope (Scope:84332, the
+# Information Technology root) has no area path of its own, so its items had nowhere to go; the Team
+# says which part of IT actually owns the work.
+#
+# The match is EXACT, and that is the whole point. Team names contain node names - "User Services -
+# Sprint" contains "User Services" - so any prefix, substring or startswith test would look correct
+# and then silently mis-file the first team that is named after something which is not a node. An
+# unmapped team is left at the root, exactly as an unmapped Theme is.
+#
+# Both spellings resolve: the raw Agility team ("IT_Operations") and the cleaned name the ADO Team
+# field shows ("Operations"), so an entry added by reading either system works.
+function ResolveTeamAreaPath([string]$team)
+{
+  if (-not $team) { return $null }
+  if (-not $script:mappings.TeamAreaPaths) { return $null }
+
+  $entry = $script:mappings.TeamAreaPaths.PSObject.Properties[$team.Trim()]
+  if ($entry) { return $entry.Value }
+
+  return $null
 }
 
 # ADO rejects a date it cannot parse, so send ISO 8601. Agility returns dates in the instance's
@@ -2573,8 +3381,10 @@ function AssertStatesExist($agilityTypes)
     $adoTypes = @($adoType)
     if ($agilityType -eq 'Epic') { $adoTypes += $script:mappings.WorkItemTypes.NestedEpic }
 
+    # StaleState is proved with the rest. It is also what stops anyone giving Issue one: Impediment
+    # has no Removed state, so the run would die here rather than on the first archived Issue.
     $spec = $script:mappings.States.PSObject.Properties[$agilityType].Value
-    $wanted = @($spec.DefaultState, $spec.ClosedState) + @($spec.Map.PSObject.Properties.Value) |
+    $wanted = @($spec.DefaultState, $spec.ClosedState, (StaleStateFor $spec)) + @($spec.Map.PSObject.Properties.Value) |
       Where-Object { $_ } | Select-Object -Unique
 
     foreach ($t in $adoTypes | Select-Object -Unique)
@@ -2657,7 +3467,26 @@ function AssertFieldsExist($agilityTypes)
 function MapState($item)
 {
   $states = GetStateMap $item
+  $state = ResolveMappedState $item $states
 
+  # Work that finished long ago is archived rather than shown as Done. Applied ONLY to an item that
+  # would otherwise land in its type's closed state, so nothing active or in progress is ever touched
+  # however old it is, and only for a type that HAS a stale state. Issue has none, because
+  # Impediment's only states are Open and Closed: the exclusion is the absence of config, not a type
+  # check, and AssertStatesExist would kill the run if anyone gave it one.
+  if ($state -eq $states.ClosedState -and (IsStaleClosedItem $item))
+  {
+    $stale = StaleStateFor $states
+    if ($stale) { return $stale }
+  }
+
+  return $state
+}
+
+# The state an item maps to before the stale rule is considered. Split out of MapState so the
+# AssetState-over-Status decision stays one readable thing beside the rule that can override it.
+function ResolveMappedState($item, $states)
+{
   if (IsAgilityClosed $item) { return $states.ClosedState }
 
   if (-not $item.Status) { return $states.DefaultState }
@@ -2666,6 +3495,65 @@ function MapState($item)
   if ($mapped) { return $mapped.Value }
 
   return $states.DefaultState
+}
+
+# The state a type sends long finished work to, or $null when it has none.
+function StaleStateFor($states)
+{
+  if (-not $states.PSObject.Properties['StaleState']) { return $null }
+
+  return $states.StaleState
+}
+
+# The moment before which finished work counts as stale, or $null when there is no such rule.
+#
+# Resolved ONCE per run from the run's start, so every item in a run is measured against the same
+# instant rather than each against its own "now". An absent, zero, or negative StaleAfterDays turns
+# the rule off: a zero would put the cutoff at the run's start and archive every closed item there is,
+# which is the one mistake here that would be both silent and enormous.
+function ResolveStaleCutoff([datetime]$runStart)
+{
+  if (-not $script:mappings.PSObject.Properties['StaleAfterDays']) { return $null }
+
+  $days = $script:mappings.StaleAfterDays
+  if ($null -eq $days -or $days -le 0) { return $null }
+
+  return $runStart.AddDays(-$days)
+}
+
+# When an item's finished work actually finished: its Agility close date, then its last change, then
+# its creation. Not every closed item carries a ClosedDate, which is the same reason the closing
+# transition falls back this way for Tasks.
+#
+# Note this is the AGE test, not the value written to the Closed Date field: that one only ever takes
+# the real Agility ClosedDate, because a fallback date is evidence of age, not a record of closure.
+# Returns $null when the item carries no date at all.
+function ResolveDoneDate($item)
+{
+  foreach ($value in @($item.ClosedDate, $item.ChangeDate, $item.CreateDate))
+  {
+    if (-not $value) { continue }
+
+    try { return [datetime]$value } catch { }
+  }
+
+  return $null
+}
+
+# Whether an item's finished work is old enough to archive. False whenever the run set no cutoff, so
+# every entry point that does not set one (CreateAreaPaths, the unit tests, a mappings.json with no
+# StaleAfterDays) behaves exactly as it did before this rule existed.
+#
+# No date at all means no evidence of age, so the item is NOT stale: under-archiving leaves a correct
+# Done behind, while inventing an age would archive work that may be current.
+function IsStaleClosedItem($item)
+{
+  if (-not $script:staleBefore) { return $false }
+
+  $done = ResolveDoneDate $item
+  if (-not $done) { return $false }
+
+  return ($done -lt $script:staleBefore)
 }
 
 # Whether an ADO state is the closed state for the item's type. ADO stamps ClosedDate on entry to
@@ -2678,6 +3566,15 @@ function MapState($item)
 function IsClosedAdoState($item, [string]$adoState)
 {
   return ($adoState -eq (GetStateMap $item).ClosedState)
+}
+
+# Whether an ADO state is the state this item's type archives long finished work into. False for a
+# type with no stale state at all, so an Issue is never treated as archived.
+function IsStaleAdoState($item, [string]$adoState)
+{
+  $stale = StaleStateFor (GetStateMap $item)
+
+  return [bool]($stale -and $adoState -eq $stale)
 }
 
 # Whether the item's Agility Status is one we actually understand. An unmapped status falls back to
@@ -2743,6 +3640,21 @@ function WriteSummary
   WriteLog "Skipped:  $script:skipped"
   WriteLog "Failed:   $script:failed"
   WriteLog "Warnings: $script:warnings"
+
+  # Of those, how many were archived because they finished before the cutoff. Printed only when a
+  # cutoff was in force, so a run with no such rule reads exactly as it always did.
+  if ($script:staleBefore)
+  {
+    WriteLog "Removed:  $script:removed  (finished before $($script:staleBefore.ToString('yyyy-MM-dd')))" Yellow
+  }
+
+  # Files are counted apart from items on purpose: an attachment that would not copy leaves a warning
+  # and a perfectly good work item, so it must not read as a failed item.
+  if ($script:attachmentsCopied -gt 0 -or $script:attachmentsFailed -gt 0)
+  {
+    WriteLog "Files:    $script:attachmentsCopied copied$(if ($script:attachmentsFailed -gt 0) { ", $script:attachmentsFailed could not be copied" })" `
+      $(if ($script:attachmentsFailed -gt 0) { 'Yellow' } else { $null })
+  }
 
   # Values a value map (Team, strategic theme) never had an entry for. Grouped by map and value so a
   # single new team does not print a line per item. These were NOT written to their field, so this

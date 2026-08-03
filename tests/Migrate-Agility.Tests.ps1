@@ -392,6 +392,238 @@ Describe "MapState" {
   }
 }
 
+##################################################################################################
+# Work finished long ago is archived rather than shown as Done.
+#
+# The rule fires only on an item that would otherwise land in its type's ClosedState, so nothing
+# active is ever touched, and only for a type that HAS a StaleState. Issue has none, because
+# Impediment's only states are Open and Closed - the exclusion is the absence of config, not a
+# hard coded type check.
+##################################################################################################
+Describe "Stale closed items become Removed" {
+
+  BeforeAll {
+    $script:mappings = [pscustomobject]@{
+      StaleAfterDays = 365
+      States = [pscustomobject]@{
+        Epic  = [pscustomobject]@{ DefaultState = "New";   ClosedState = "Done";   StaleState = "Removed"
+                                   Map = [pscustomobject]@{ "In Progress" = "In Progress"; "Done" = "Done" } }
+        Story = [pscustomobject]@{ DefaultState = "New";   ClosedState = "Done";   StaleState = "Removed"
+                                   Map = [pscustomobject]@{ "Done" = "Done" } }
+        Task  = [pscustomobject]@{ DefaultState = "To Do"; ClosedState = "Done";   StaleState = "Removed"
+                                   Map = [pscustomobject]@{} }
+        # No StaleState on purpose: Impediment has no Removed state to move to.
+        Issue = [pscustomobject]@{ DefaultState = "Open";  ClosedState = "Closed"
+                                   Map = [pscustomobject]@{} }
+      }
+    }
+
+    # A fixed cutoff, so these tests do not drift as the calendar moves.
+    $script:staleBefore = [datetime]"2025-01-01"
+
+    function NewClosedItem($props)
+    {
+      $base = @{
+        AgilityType = "Epic"; AssetState = 128; Status = $null
+        ClosedDate = $null; ChangeDate = $null; CreateDate = $null
+      }
+      foreach ($k in $props.Keys) { $base[$k] = $props[$k] }
+      return [pscustomobject]$base
+    }
+  }
+
+  It "removes a closed Epic whose close date is older than the cutoff" {
+    MapState (NewClosedItem @{ ClosedDate = "2019-03-04" }) | Should -Be "Removed"
+  }
+
+  It "leaves a recently closed Epic in Done" {
+    MapState (NewClosedItem @{ ClosedDate = "2025-06-01" }) | Should -Be "Done"
+  }
+
+  # The trigger is the ADO state the item would land in, not AssetState. An item Agility still calls
+  # active but whose Status maps to Done arrives closed in ADO, and is archived on the same rule.
+  It "removes a Story that reached Done through its Status rather than its AssetState" {
+    MapState (NewClosedItem @{ AgilityType = "Story"; AssetState = 64; Status = "Done"; ClosedDate = "2019-03-04" }) |
+      Should -Be "Removed"
+  }
+
+  It "never removes an Issue, because Impediment has no Removed state" {
+    MapState (NewClosedItem @{ AgilityType = "Issue"; ClosedDate = "2010-01-01" }) | Should -Be "Closed"
+  }
+
+  It "leaves unfinished work alone however old it is" {
+    MapState (NewClosedItem @{ AssetState = 64; Status = "In Progress"; CreateDate = "2005-01-01" }) |
+      Should -Be "In Progress"
+  }
+
+  # Not every closed item carries a real ClosedDate, which is already why the closing transition
+  # falls back this way for Tasks. Same chain here, for the same reason.
+  It "falls back to the change date when Agility has no close date" {
+    MapState (NewClosedItem @{ ChangeDate = "2019-03-04" }) | Should -Be "Removed"
+  }
+
+  It "falls back to the create date when there is neither" {
+    MapState (NewClosedItem @{ CreateDate = "2019-03-04" }) | Should -Be "Removed"
+  }
+
+  # No date at all means no evidence of age. Leaving it Done under-removes; inventing an age would
+  # archive work that might be current.
+  It "leaves a closed item with no date at all in Done rather than inventing an age" {
+    MapState (NewClosedItem @{}) | Should -Be "Done"
+  }
+
+  It "prefers the real close date over the change date" {
+    ResolveDoneDate (NewClosedItem @{ ClosedDate = "2019-03-04"; ChangeDate = "2026-01-01" }) |
+      Should -Be ([datetime]"2019-03-04")
+  }
+
+  It "returns no done date for an item that carries none" {
+    ResolveDoneDate (NewClosedItem @{}) | Should -BeNullOrEmpty
+  }
+
+  It "treats an item closed exactly on the cutoff as not yet stale" {
+    MapState (NewClosedItem @{ ClosedDate = "2025-01-01" }) | Should -Be "Done"
+  }
+
+  # Every other entry point (CreateAreaPaths, the unit tests, a mappings file with no StaleAfterDays)
+  # leaves the cutoff unset, and must behave exactly as it did before this rule existed.
+  It "removes nothing when no cutoff is set, so the rule is off unless a run configures it" {
+    $saved = $script:staleBefore
+    $script:staleBefore = $null
+    try     { MapState (NewClosedItem @{ ClosedDate = "2010-01-01" }) | Should -Be "Done" }
+    finally { $script:staleBefore = $saved }
+  }
+}
+
+Describe "ResolveStaleCutoff" {
+
+  It "counts StaleAfterDays back from the run start" {
+    $script:mappings = [pscustomobject]@{ StaleAfterDays = 365 }
+    ResolveStaleCutoff ([datetime]"2026-07-30") | Should -Be ([datetime]"2025-07-30")
+  }
+
+  It "returns null when StaleAfterDays is absent, so an unconfigured run removes nothing" {
+    $script:mappings = [pscustomobject]@{}
+    ResolveStaleCutoff ([datetime]"2026-07-30") | Should -BeNullOrEmpty
+  }
+
+  # A zero would make the cutoff "now" and archive every closed item in the instance.
+  It "returns null for a zero or negative StaleAfterDays rather than removing everything" {
+    $script:mappings = [pscustomobject]@{ StaleAfterDays = 0 }
+    ResolveStaleCutoff ([datetime]"2026-07-30") | Should -BeNullOrEmpty
+
+    $script:mappings = [pscustomobject]@{ StaleAfterDays = -1 }
+    ResolveStaleCutoff ([datetime]"2026-07-30") | Should -BeNullOrEmpty
+  }
+}
+
+##################################################################################################
+# Removed accepts a Closed Date and does not require one - verified live on Epic, Product Backlog
+# Item, Bug and Task (bypass transition to Removed with a date, then a rule-checked patch: all
+# passed, the date read back, and an empty one passed too). So the real Agility close date rides
+# along, and nothing is ever fabricated for it.
+##################################################################################################
+Describe "The close date rides along on a Removed transition" {
+
+  BeforeAll {
+    $script:mappings = [pscustomobject]@{
+      Fields = [pscustomobject]@{ ClosedDate = "Microsoft.VSTS.Common.ClosedDate" }
+      States = [pscustomobject]@{
+        Epic = [pscustomobject]@{ DefaultState = "New";   ClosedState = "Done"; StaleState = "Removed"; Map = [pscustomobject]@{} }
+        Task = [pscustomobject]@{ DefaultState = "To Do"; ClosedState = "Done"; StaleState = "Removed"; Map = [pscustomobject]@{} }
+      }
+    }
+    $script:config = [pscustomobject]@{ AzureDevOps = [pscustomobject]@{ OrganizationUrl = "https://dev.azure.com/org" } }
+
+    function NewRemovedItem($props)
+    {
+      $base = @{
+        AgilityType = "Epic"; ChangedByEmail = $null; ChangedByName = $null
+        CreatedByEmail = "creator@example.com"; CreatedByName = $null
+        CreateDate = "2020-01-01"; ChangeDate = "2020-06-01"; ClosedDate = $null
+      }
+      foreach ($k in $props.Keys) { $base[$k] = $props[$k] }
+      return [pscustomobject]$base
+    }
+
+    function RemovedClosedOp($item, $state)
+    {
+      $script:sent = $null
+      Mock InvokeAdoRequest { $script:sent = [pscustomobject]@{ Url = $url; Body = $body } }
+      SetAdoState 42 $state $item
+      return @($script:sent.Body | Where-Object { $_.path -eq "/fields/Microsoft.VSTS.Common.ClosedDate" })[0]
+    }
+  }
+
+  It "recognises the type's stale ADO state" {
+    IsStaleAdoState ([pscustomobject]@{ AgilityType = "Epic" }) "Removed" | Should -BeTrue
+    IsStaleAdoState ([pscustomobject]@{ AgilityType = "Epic" }) "Done"    | Should -BeFalse
+  }
+
+  It "does not call a type with no stale state removed" {
+    $script:mappings.States | Add-Member -NotePropertyName Issue `
+      -NotePropertyValue ([pscustomobject]@{ DefaultState = "Open"; ClosedState = "Closed"; Map = [pscustomobject]@{} }) -Force
+
+    IsStaleAdoState ([pscustomobject]@{ AgilityType = "Issue" }) "Removed" | Should -BeFalse
+  }
+
+  It "writes the real Agility close date on a Removed transition" {
+    $op = RemovedClosedOp (NewRemovedItem @{ ClosedDate = "2019-03-04" }) "Removed"
+
+    $op | Should -Not -BeNullOrEmpty
+    $op.value | Should -BeLike "2019-03-04T*Z"
+    $script:sent.Url | Should -BeLike "*bypassRules=true*"
+  }
+
+  # Removed does not require a close date on any type, verified live - so unlike Task's Done, an
+  # absent one is left absent rather than fabricated from the change date.
+  It "does not fabricate a close date for a Task sent to Removed" {
+    RemovedClosedOp (NewRemovedItem @{ AgilityType = "Task"; ClosedDate = $null; ChangeDate = "2020-06-01" }) "Removed" |
+      Should -BeNullOrEmpty
+  }
+
+  It "still fabricates one for a Task sent to Done, which does require it" {
+    $op = RemovedClosedOp (NewRemovedItem @{ AgilityType = "Task"; ClosedDate = $null; ChangeDate = "2020-06-01" }) "Done"
+
+    $op | Should -Not -BeNullOrEmpty
+    $op.value | Should -BeLike "2020-06-01T*Z"
+  }
+}
+
+##################################################################################################
+# A typo in StaleState must fail on call one, not on item one of tens of thousands. This is also
+# what stops anyone giving Issue a StaleState: Impediment has no Removed, so the run dies here.
+##################################################################################################
+Describe "AssertStatesExist proves the stale state too" {
+
+  BeforeAll {
+    $script:config = [pscustomobject]@{
+      AzureDevOps = [pscustomobject]@{ OrganizationUrl = "https://dev.azure.com/org"; Project = "Migration" }
+    }
+    $script:mappings = [pscustomobject]@{
+      WorkItemTypes = [pscustomobject]@{ Story = "Product Backlog Item" }
+      States = [pscustomobject]@{
+        Story = [pscustomobject]@{ DefaultState = "New"; ClosedState = "Done"; StaleState = "Removed"
+                                   Map = [pscustomobject]@{ "Done" = "Done" } }
+      }
+    }
+  }
+
+  It "throws when the work item type does not have the configured stale state" {
+    Mock InvokeAdoRequest { [pscustomobject]@{ value = @(
+      [pscustomobject]@{ name = "New" }, [pscustomobject]@{ name = "Done" }) } }
+
+    { AssertStatesExist @('Story') } | Should -Throw -ExpectedMessage "*Removed*"
+  }
+
+  It "passes when it does" {
+    Mock InvokeAdoRequest { [pscustomobject]@{ value = @(
+      [pscustomobject]@{ name = "New" }, [pscustomobject]@{ name = "Done" }, [pscustomobject]@{ name = "Removed" }) } }
+
+    { AssertStatesExist @('Story') } | Should -Not -Throw
+  }
+}
+
 Describe "ResolveAreaPath" {
 
   BeforeAll {
@@ -421,6 +653,81 @@ Describe "ResolveAreaPath" {
 
   It "falls back rather than inventing a node for an unmapped Theme" {
     ResolveAreaPath "IT\Operations" "Some Other Theme" | Should -Be "IT\Operations"
+  }
+}
+
+##################################################################################################
+# The Team is the LAST resort for an area path, used only when an item would otherwise land at the
+# project root. Measured across all 53,655 items: 122 land at root, and 30 of those carry a Team.
+#
+# The map is EXACT, never a substring or prefix match. "User Services - Sprint" contains the node
+# name "User Services", so a prefix match would look right and then be wrong the moment a team is
+# named after something that is not a node. Each entry below is evidence: every mapped team has
+# 99.8-100% of its work in the scope it maps to.
+##################################################################################################
+Describe "Team as an area path fallback" {
+
+  BeforeAll {
+    $script:mappings = [pscustomobject]@{
+      ThemeAreaPaths = [pscustomobject]@{ "Applications" = "Apps" }
+      TeamAreaPaths  = [pscustomobject]@{
+        "IT_Operations"            = "Operations"
+        "Operations"               = "Operations"
+        "ITUser Services - Sprint" = "User Services"
+        "User Services - Sprint"   = "User Services"
+      }
+      TeamValueMap = [pscustomobject]@{
+        "IT_Operations"            = "Operations"
+        "ITUser Services - Sprint" = "User Services - Sprint"
+      }
+    }
+  }
+
+  It "deduces the area path from the Team when the item would land at the root" {
+    ResolveAreaPath "" $null "IT_Operations" | Should -Be "Operations"
+  }
+
+  # The user reads the ADO Team field, which shows the CLEANED name, so both spellings resolve.
+  It "accepts the cleaned team name as well as the raw one" {
+    ResolveAreaPath "" $null "Operations" | Should -Be "Operations"
+  }
+
+  # The exact hazard called out: this team's NAME contains a node name, and it must resolve by the
+  # map rather than by anything that looks at the text.
+  It "maps a team whose name contains a node name, without matching on the text" {
+    ResolveAreaPath "" $null "ITUser Services - Sprint" | Should -Be "User Services"
+    ResolveAreaPath "" $null "User Services - Sprint"   | Should -Be "User Services"
+  }
+
+  It "leaves the item at the root when the team is not in the map" {
+    ResolveAreaPath "" $null "Reg Scrum" | Should -Be ""
+  }
+
+  It "leaves the item at the root when it has no team at all" {
+    ResolveAreaPath "" $null $null | Should -Be ""
+    ResolveAreaPath "" $null ""    | Should -Be ""
+  }
+
+  # The scope is better evidence than the team, so it must never be overridden.
+  It "never overrides a scope that already has an area path" {
+    ResolveAreaPath "User Services" $null "IT_Operations" | Should -Be "User Services"
+  }
+
+  # And the Theme is better evidence still.
+  It "never overrides a theme leaf" {
+    ResolveAreaPath "Operations" "Applications" "ITUser Services - Sprint" | Should -Be "Operations\Apps"
+  }
+
+  # A themed item in the ROOT scope would otherwise resolve to a bare leaf with no parent node, which
+  # ADO rejects with TF401347. There are none today, but the team gives it a real home if one appears.
+  It "prefers the team over a bare leaf when the scope is the root" {
+    ResolveAreaPath "" "Applications" "IT_Operations" | Should -Be "Operations\Apps"
+  }
+
+  It "resolves a team to its area path, or null when unmapped" {
+    ResolveTeamAreaPath "IT_Operations" | Should -Be "Operations"
+    ResolveTeamAreaPath "Reg Scrum"     | Should -BeNullOrEmpty
+    ResolveTeamAreaPath $null           | Should -BeNullOrEmpty
   }
 }
 
@@ -1192,34 +1499,107 @@ Describe "FormatAreaPath" {
   }
 }
 
+##################################################################################################
+# The migration footer moved OUT of the description and into a Discussion comment on 2026-07-30, at
+# the user's request: the description should carry the item's own content, not our provenance note.
+##################################################################################################
 Describe "BuildDescription" {
 
   BeforeAll {
     $script:numberByOid = @{ "Epic:2" = "E-02002" }
   }
 
-  It "stamps the Agility Number into a footer for traceability" {
+  It "no longer stamps a migration footer into the description" {
     $epic = [pscustomobject]@{ Description = "<p>body</p>"; Number = "E-01001"; Flattened = $false; TrueParentOid = $null }
 
-    BuildDescription $epic | Should -BeLike "*<p>body</p>*E-01001*"
+    $html = BuildDescription $epic
+    $html | Should -Be "<p>body</p>"
+    $html | Should -Not -Match "Migrated from"
   }
 
-  It "still stamps the footer when the Agility description is empty" {
+  # The footer used to guarantee a non empty description. Without it an item that had nothing to say
+  # in Agility says nothing in ADO, rather than carrying a line of our own bookkeeping.
+  It "returns an empty description when Agility had none" {
     $epic = [pscustomobject]@{ Description = $null; Number = "E-01001"; Flattened = $false; TrueParentOid = $null }
 
-    BuildDescription $epic | Should -BeLike "*E-01001*"
+    BuildDescription $epic | Should -Be ""
   }
 
-  It "names the real Agility parent when the Epic was flattened" {
+  It "no longer names the flattened parent in the description either" {
     $epic = [pscustomobject]@{ Description = "<p>body</p>"; Number = "E-01001"; Flattened = $true; TrueParentOid = "Epic:2" }
 
-    BuildDescription $epic | Should -BeLike "*Agility parent: E-02002*"
+    BuildDescription $epic | Should -Not -Match "Agility parent"
   }
 
-  It "does not mention a parent when the Epic was not flattened" {
-    $epic = [pscustomobject]@{ Description = "<p>body</p>"; Number = "E-01001"; Flattened = $false; TrueParentOid = "Epic:2" }
+  # Everything the description legitimately carries must survive the footer's removal.
+  It "still carries the content blocks that belong to the item" {
+    $epic = [pscustomobject]@{
+      Description = "<p>body</p>"; Number = "E-01001"; Flattened = $false; TrueParentOid = $null
+      AgilityType = "Defect"; Resolution = "fixed it"; Timebox = "Sprint 3"
+    }
 
-    BuildDescription $epic | Should -Not -BeLike "*Agility parent*"
+    $html = BuildDescription $epic
+    $html | Should -Match "body"
+    $html | Should -Match "fixed it"
+    $html | Should -Match "Sprint 3"
+  }
+}
+
+Describe "The migration note is a Discussion comment" {
+
+  BeforeAll {
+    $script:config = [pscustomobject]@{ AzureDevOps = [pscustomobject]@{ OrganizationUrl = "https://dev.azure.com/org" } }
+    $script:numberByOid = @{ "Epic:2" = "E-02002" }
+  }
+
+  BeforeEach { $script:DryRun = $false; $script:sent = $null }
+
+  It "says where the item came from" {
+    BuildMigrationNote ([pscustomobject]@{ Number = "E-08866"; Flattened = $false; TrueParentOid = $null }) |
+      Should -Be "Migrated from digital.ai Agility E-08866"
+  }
+
+  It "names the real parent when the Epic was flattened onto the root" {
+    BuildMigrationNote ([pscustomobject]@{ Number = "E-01001"; Flattened = $true; TrueParentOid = "Epic:2" }) |
+      Should -Match "Agility parent: E-02002"
+  }
+
+  It "does not mention a parent when nothing was flattened" {
+    BuildMigrationNote ([pscustomobject]@{ Number = "E-01001"; Flattened = $false; TrueParentOid = "Epic:2" }) |
+      Should -Not -Match "Agility parent"
+  }
+
+  # System.History IS the discussion entry. It must be rule-checked and must NOT carry a ChangedDate,
+  # or the comment would be backdated to the Agility date instead of showing today.
+  It "patches System.History without bypassRules and without a date" {
+    Mock InvokeAdoRequest { $script:sent = [pscustomobject]@{ Url = $url; Body = $body } }
+
+    AddAdoMigrationComment 42 ([pscustomobject]@{ Number = "E-08866"; Flattened = $false; TrueParentOid = $null })
+
+    $script:sent.Url | Should -Not -BeLike "*bypassRules*"
+    @($script:sent.Body).Count | Should -Be 1
+    $script:sent.Body[0].path  | Should -Be "/fields/System.History"
+    $script:sent.Body[0].value | Should -Be "Migrated from digital.ai Agility E-08866"
+  }
+
+  It "writes no comment on a dry run" {
+    $script:DryRun = $true
+    Mock InvokeAdoRequest { $script:sent = [pscustomobject]@{ Url = $url; Body = $body } }
+
+    AddAdoMigrationComment 42 ([pscustomobject]@{ Number = "E-08866"; Flattened = $false; TrueParentOid = $null })
+
+    $script:sent | Should -BeNullOrEmpty
+  }
+
+  # A comment is bookkeeping. The work item already exists by the time it is added, so a failure here
+  # must warn rather than fail an item that is otherwise complete.
+  It "warns rather than failing the item when the comment cannot be added" {
+    $script:warnings = 0
+    Mock InvokeAdoRequest { throw "comment exploded" }
+
+    { AddAdoMigrationComment 42 ([pscustomobject]@{ Number = "E-08866"; Flattened = $false; TrueParentOid = $null }) } |
+      Should -Not -Throw
+    $script:warnings | Should -BeGreaterThan 0
   }
 }
 
@@ -1247,21 +1627,44 @@ AfterAll {
   Remove-Variable -Name AgilityEpicsLoadFunctionsOnly -Scope Global -ErrorAction SilentlyContinue
 }
 
+##################################################################################################
+# Closed items are ALWAYS migrated: -IncludeClosed was removed on 2026-07-30 because every real run
+# used it. Dead items are still never migrated, and that is the whole risk of the removal - the two
+# filters used to be the two halves of one conditional, so dropping the wrong half would have
+# migrated the 18 placeholder templates ("IT - Registration Checklist - <insert semester>").
+##################################################################################################
 Describe "Closed and Dead filtering" {
 
-  It "excludes closed Epics by default" {
+  It "no longer filters closed items out, because closed items always migrate" {
     $source = Get-Content $script:scriptPath -Raw
-    $source | Should -Match "AssetState!='Closed'"
+
+    $source | Should -Not -Match "AssetState!='Closed'" `
+      -Because "every run includes closed items, so there is no closed filter left to apply"
   }
 
-  It "never migrates Dead Epics, which are placeholder templates, even with -IncludeClosed" {
-    # -IncludeClosed used to drop the where clause entirely, which would have migrated the 18 Dead
-    # template epics ("IT - Registration Checklist - <insert semester>").
+  It "never migrates Dead items, which are placeholder templates" {
     $source = Get-Content $script:scriptPath -Raw
 
-    $source | Should -Match "AssetState!='Dead'" -Because "-IncludeClosed must still filter Dead out"
-    $source | Should -Not -Match 'IncludeClosed[^\n]*\n[^\n]*where = "Scope=.\$agilityScope."\s*\n\s*\}' `
-      -Because "there must be no code path that queries with no AssetState filter"
+    $source | Should -Match "AssetState!='Dead'"
+  }
+
+  # The invariant that replaces the old conditional: every Agility query that scopes by Scope also
+  # filters Dead. Counting them is what catches a future query added without the filter.
+  It "puts the Dead filter on every scoped Agility query, with none left unfiltered" {
+    $source = Get-Content $script:scriptPath -Raw
+
+    $scoped = @([regex]::Matches($source, '\$where\s*=\s*"Scope=')).Count
+    $dead   = @([regex]::Matches($source, "AssetState!='Dead'")).Count
+
+    $scoped | Should -BeGreaterThan 0
+    $dead   | Should -Be $scoped -Because "each scoped query needs exactly one Dead filter"
+  }
+
+  It "has no trace of the removed switch left" {
+    $source = Get-Content $script:scriptPath -Raw
+
+    $source | Should -Not -Match 'IncludeClosed' `
+      -Because "the switch is gone, and a stale reference would read as if it still worked"
   }
 }
 
@@ -1342,9 +1745,11 @@ Describe "ClosedDate" {
     $stateBody = BodyOf $source 'SetAdoState'
     $stateBody | Should -Not -Match '/fields/System\.AssignedTo'
 
-    # SetAdoAssignee, which does write AssignedTo, is rule checked: no bypassRules.
+    # SetAdoAssignee, which does write AssignedTo, is rule checked: no bypassRules. Match the query
+    # string it would actually use, not the bare word, for the same reason as above: a comment
+    # explaining why there is no bypass here must not read as a bypass.
     $assigneeBody = BodyOf $source 'SetAdoAssignee'
-    $assigneeBody | Should -Not -Match 'bypassRules'
+    $assigneeBody | Should -Not -Match 'bypassRules=true'
   }
 
   # The trigger is the MAPPED ADO state, not IsAgilityClosed: an item whose Status maps to Done gets a
@@ -2517,6 +2922,981 @@ Describe "GetSelection" {
     GetSelection 'Issue' | Should -Match 'BlockedPrimaryWorkitems\.Number'
     GetSelection 'Issue' | Should -Match 'BlockedEpics\.Number'
   }
+
+  # Found by auditing all 143 attributes the Epic type declares against the live data on 2026-07-30.
+  # Each of these carries real data on Epics and was never being read.
+  It "asks Epic for the attributes the field audit found carrying data" {
+    $sel = GetSelection 'Epic'
+
+    foreach ($attr in @('Source.Name', 'TaggedWith', 'ClosedBy.Name', 'ClosedBy.Email',
+                        'Links.URL', 'Links.Name', 'Dependencies.Number', 'Dependants.Number'))
+    {
+      $sel | Should -Match ([regex]::Escape($attr)) -Because "Epic carries data in $attr"
+    }
+  }
+
+  # The four that have no ADO field and go to the description instead.
+  It "asks Epic for the four attributes that ride in the description" {
+    $sel = GetSelection 'Epic'
+
+    foreach ($attr in @('Custom_PersonaImpacts.Name', 'Risk', 'Reference', 'RequestedBy'))
+    {
+      $sel | Should -Match ([regex]::Escape($attr)) -Because "Epic carries data in $attr"
+    }
+  }
+
+  # The oids drive the download; the filenames name the file in ADO. Both are needed.
+  It "asks Epic for its attachments and their filenames" {
+    $sel = GetSelection 'Epic'
+
+    $sel | Should -Match '(^|,)Attachments(,|$)'
+    $sel | Should -Match ([regex]::Escape('Attachments.Filename'))
+  }
+
+  ##################################################################################################
+  # Parity for the other four types (2026-07-30). ClosedBy, TaggedWith, Attachments and Links exist
+  # on EVERY Agility type here and carry data on all of them, so they live in the shared selection
+  # rather than being repeated five times. Measured across the whole instance:
+  #   ClosedBy    Story 7,274  Defect 699  Task 41,643  Issue 345
+  #   TaggedWith  Story   351  Defect   5  Task    957  Issue  10
+  #   Attachments Story   639  Defect  74  Task  1,294  Issue  13
+  #   Links       Story   204  Defect  11  Task    167  Issue   0 (exists, empty)
+  ##################################################################################################
+  It "asks EVERY type for the attributes that exist on all of them" {
+    foreach ($type in @('Epic', 'Story', 'Defect', 'Task', 'Issue'))
+    {
+      $sel = GetSelection $type
+      foreach ($attr in @('ClosedBy.Name', 'ClosedBy.Email', 'TaggedWith',
+                          'Attachments', 'Attachments.Filename', 'Links.URL', 'Links.Name'))
+      {
+        $sel | Should -Match ([regex]::Escape($attr)) -Because "$type carries $attr"
+      }
+    }
+  }
+
+  # Dependencies/Dependants exist ONLY on Epic, Story and Defect. Selecting one on Task or Issue is
+  # an "Unknown token" 400 that fails the entire page, so this is a hard boundary, not a preference.
+  It "asks Story and Defect for their dependencies, which are far bigger than Epic's" {
+    foreach ($type in @('Story', 'Defect'))
+    {
+      GetSelection $type | Should -Match ([regex]::Escape('Dependencies.Number'))
+      GetSelection $type | Should -Match ([regex]::Escape('Dependants.Number'))
+    }
+  }
+
+  It "never asks Task or Issue for dependencies, which those types do not have" {
+    foreach ($type in @('Task', 'Issue'))
+    {
+      GetSelection $type | Should -Not -Match 'Dependencies' -Because "$type has no Dependencies attribute"
+      GetSelection $type | Should -Not -Match 'Dependants'   -Because "$type has no Dependants attribute"
+    }
+  }
+
+  # 474 Stories name a requester and 1 carries a reference; both ride in the description block.
+  It "asks Story for the requester and reference that ride in the description" {
+    GetSelection 'Story' | Should -Match 'RequestedBy'
+    GetSelection 'Story' | Should -Match 'Reference'
+  }
+
+  # Defect and Task have NEITHER attribute; asking is a 400.
+  It "never asks Defect or Task for Risk or RequestedBy, which do not exist there" {
+    foreach ($type in @('Defect', 'Task'))
+    {
+      GetSelection $type | Should -Not -Match 'RequestedBy' -Because "$type has no RequestedBy attribute"
+      GetSelection $type | Should -Not -Match '(^|,)Risk(,|$)' -Because "$type has no Risk attribute"
+    }
+  }
+}
+
+##################################################################################################
+# Attachments: 61 files hang off Agility Epics (21.4 MB, largest 3.3 MB, none near ADO's 60 MB cap).
+# Instance wide there are 3,574, most of them on Tasks and Stories, so this is built type-agnostic.
+#
+# Verified live end to end before any of this was written: the Epic selection accepts the tokens, the
+# aligned oid/filename lists line up, attachment.img/{numericId} returns raw bytes, ADO's attachment
+# endpoint accepts them, and the attached file reads back byte-for-byte the same size.
+##################################################################################################
+Describe "Agility attachment identity" {
+
+  It "takes the numeric id off an attachment oid, which is what the byte endpoint wants" {
+    AgilityAttachmentId 'Attachment:243961' | Should -Be '243961'
+  }
+
+  # Oids can carry a moment suffix, exactly as asset oids do.
+  It "ignores a moment suffix on the oid" {
+    AgilityAttachmentId 'Attachment:243961:99' | Should -Be '243961'
+  }
+
+  It "returns nothing for an empty or unusable oid rather than building a broken url" {
+    AgilityAttachmentId ''        | Should -BeNullOrEmpty
+    AgilityAttachmentId $null     | Should -BeNullOrEmpty
+    AgilityAttachmentId 'rubbish' | Should -BeNullOrEmpty
+  }
+
+  It "downloads from the attachment endpoint, not the data endpoint" {
+    $script:config = [pscustomobject]@{ Agility = [pscustomobject]@{ BaseUrl = "https://v1host/Inst/" } }
+    $script:asked = $null
+    Mock InvokeAgilityDownload { $script:asked = $url; return ,([byte[]]@(1, 2, 3)) }
+
+    $bytes = GetAgilityAttachmentBytes 'Attachment:243961'
+
+    $script:asked | Should -Be 'https://v1host/Inst/attachment.img/243961'
+    $bytes.Length | Should -Be 3
+  }
+
+  # This is the whole ball game for binary. PowerShell enumerates a collection on output, so a
+  # byte[] returned normally arrives as an Object[] of boxed bytes - which has the same .Length, so
+  # a length assertion cannot see the difference. Uploading THAT stringifies it: measured live, a
+  # 40,593 byte .docx arrived in ADO as 134,696 bytes, roughly 3.3x, on all 9 files of E-03934.
+  # Only the type assertion catches it.
+  It "returns the bytes as a real byte array, not an unrolled collection" {
+    $script:config = [pscustomobject]@{ Agility = [pscustomobject]@{ BaseUrl = "https://v1host/Inst" } }
+    Mock InvokeAgilityDownload { return ,([byte[]]@(1, 2, 3)) }
+
+    $bytes = GetAgilityAttachmentBytes 'Attachment:1'
+
+    $bytes -is [byte[]]      | Should -BeTrue -Because "an Object[] of bytes uploads corrupted"
+    $bytes.GetType().Name    | Should -Be 'Byte[]'
+  }
+
+  # The hop that actually broke: InvokeWithRetry hands its result back through the pipeline, which
+  # enumerated the byte[] away. Mocking the web call rather than the download proves the download
+  # itself preserves the array, which the test above cannot see.
+  It "carries the byte array intact through the retry wrapper" {
+    Mock Invoke-WebRequest { return [pscustomobject]@{ Content = [byte[]]@(9, 8, 7, 6) } }
+
+    $bytes = InvokeAgilityDownload 'https://v1host/Inst/attachment.img/1'
+
+    $bytes -is [byte[]]   | Should -BeTrue -Because "InvokeWithRetry enumerates a bare byte[] into Object[]"
+    $bytes.GetType().Name | Should -Be 'Byte[]'
+    $bytes.Length         | Should -Be 4
+    $bytes[0]             | Should -Be 9
+  }
+}
+
+Describe "Attachments are parsed off the item" {
+
+  It "reads attachment oids and filenames, aligned" {
+    $payload = [pscustomobject]@{ Assets = @([pscustomobject]@{ id = "Epic:1"; Attributes = [pscustomobject]@{
+      'Attachments' = [pscustomobject]@{ value = @(
+        [pscustomobject]@{ idref = 'Attachment:1' }, [pscustomobject]@{ idref = 'Attachment:2' }) }
+      'Attachments.Filename' = [pscustomobject]@{ value = @('a.pdf', 'b.docx') }
+    } }) }
+
+    $parsed = ConvertFromAgilityAssets $payload 'Epic'
+
+    $parsed[0].AttachmentOids  | Should -Be @('Attachment:1', 'Attachment:2')
+    $parsed[0].AttachmentNames | Should -Be @('a.pdf', 'b.docx')
+  }
+
+  # Same null-padding trap as the owner lists: a file with no name must not slide the others up.
+  It "keeps the lists aligned when one attachment has no filename" {
+    $payload = [pscustomobject]@{ Assets = @([pscustomobject]@{ id = "Epic:1"; Attributes = [pscustomobject]@{
+      'Attachments' = [pscustomobject]@{ value = @(
+        [pscustomobject]@{ idref = 'Attachment:1' }, [pscustomobject]@{ idref = 'Attachment:2' },
+        [pscustomobject]@{ idref = 'Attachment:3' }) }
+      'Attachments.Filename' = [pscustomobject]@{ value = @('a.pdf', $null, 'c.docx') }
+    } }) }
+
+    $parsed = ConvertFromAgilityAssets $payload 'Epic'
+
+    @($parsed[0].AttachmentOids).Count  | Should -Be 3
+    @($parsed[0].AttachmentNames).Count | Should -Be 3
+    @($parsed[0].AttachmentNames)[2]    | Should -Be 'c.docx'
+  }
+
+  It "has no attachments for an item that carries none" {
+    $payload = [pscustomobject]@{ Assets = @([pscustomobject]@{ id = "Epic:1"; Attributes = [pscustomobject]@{} }) }
+
+    @((ConvertFromAgilityAssets $payload 'Epic')[0].AttachmentOids).Count | Should -Be 0
+  }
+}
+
+Describe "AddAdoAttachments" {
+
+  BeforeAll {
+    $script:config = [pscustomobject]@{
+      Agility     = [pscustomobject]@{ BaseUrl = "https://v1host/Inst" }
+      AzureDevOps = [pscustomobject]@{ OrganizationUrl = "https://dev.azure.com/org"; Project = "Migration" }
+    }
+
+    function NewAttachedItem($oids, $names)
+    {
+      return [pscustomobject]@{ Number = "E-1"; AttachmentOids = $oids; AttachmentNames = $names }
+    }
+  }
+
+  BeforeEach {
+    $script:DryRun = $false
+    $script:warnings = 0
+    $script:attachmentsCopied = 0
+    $script:attachmentsFailed = 0
+    $script:patches = @()
+    $script:uploaded = @()
+  }
+
+  It "uploads each file and attaches it to the work item" {
+    Mock GetAgilityAttachmentBytes { return [byte[]]@(1, 2, 3) }
+    Mock NewAdoAttachment { $script:uploaded += $fileName; return "https://ado/att/$fileName" }
+    Mock InvokeAdoRequest { $script:patches += ,$body }
+
+    AddAdoAttachments 42 (NewAttachedItem @('Attachment:1', 'Attachment:2') @('a.pdf', 'b.docx'))
+
+    $script:uploaded          | Should -Be @('a.pdf', 'b.docx')
+    $script:attachmentsCopied | Should -Be 2
+    @($script:patches).Count  | Should -Be 2
+    $script:patches[0][0].path      | Should -Be '/relations/-'
+    $script:patches[0][0].value.rel | Should -Be 'AttachedFile'
+    $script:patches[0][0].value.url | Should -Be 'https://ado/att/a.pdf'
+  }
+
+  It "does nothing at all for an item with no attachments" {
+    Mock GetAgilityAttachmentBytes { throw "should not be called" }
+    Mock InvokeAdoRequest { throw "should not be called" }
+
+    { AddAdoAttachments 42 (NewAttachedItem @() @()) } | Should -Not -Throw
+    $script:attachmentsCopied | Should -Be 0
+  }
+
+  # A dry run writes nothing, and must not spend bandwidth downloading either.
+  It "downloads and uploads nothing on a dry run" {
+    $script:DryRun = $true
+    Mock GetAgilityAttachmentBytes { throw "a dry run must not download" }
+    Mock NewAdoAttachment { throw "a dry run must not upload" }
+    Mock InvokeAdoRequest { throw "a dry run must not write" }
+
+    { AddAdoAttachments 42 (NewAttachedItem @('Attachment:1') @('a.pdf')) } | Should -Not -Throw
+  }
+
+  # One bad file must not cost the item its other files, and must never fail the work item, which by
+  # this point already exists in ADO.
+  It "keeps going when one attachment fails, and counts it" {
+    Mock GetAgilityAttachmentBytes {
+      if ($oid -eq 'Attachment:1') { throw "download exploded" }
+      return [byte[]]@(1, 2, 3)
+    }
+    Mock NewAdoAttachment { $script:uploaded += $fileName; return "https://ado/att/$fileName" }
+    Mock InvokeAdoRequest { $script:patches += ,$body }
+
+    { AddAdoAttachments 42 (NewAttachedItem @('Attachment:1', 'Attachment:2') @('a.pdf', 'b.docx')) } |
+      Should -Not -Throw
+
+    $script:uploaded          | Should -Be @('b.docx')
+    $script:attachmentsCopied | Should -Be 1
+    $script:attachmentsFailed | Should -Be 1
+  }
+
+  # ADO rejects anything over 60 MB, so skipping is the only way the rest of the item survives.
+  It "skips a file bigger than ADO will accept, and warns rather than failing" {
+    Mock GetAgilityAttachmentBytes { return [byte[]]::new($script:AttachmentMaxBytes + 1) }
+    Mock NewAdoAttachment { throw "must not upload an oversize file" }
+    Mock InvokeAdoRequest { throw "must not attach an oversize file" }
+
+    { AddAdoAttachments 42 (NewAttachedItem @('Attachment:1') @('big.zip')) } | Should -Not -Throw
+
+    $script:attachmentsCopied | Should -Be 0
+    $script:attachmentsFailed | Should -Be 1
+    $script:warnings          | Should -BeGreaterThan 0
+  }
+
+  # Filename is what names the file in ADO. Agility does not guarantee one.
+  It "falls back to a usable name when the attachment has no filename" {
+    Mock GetAgilityAttachmentBytes { return [byte[]]@(1) }
+    Mock NewAdoAttachment { $script:uploaded += $fileName; return "https://ado/att/x" }
+    Mock InvokeAdoRequest { }
+
+    AddAdoAttachments 42 (NewAttachedItem @('Attachment:7') @($null))
+
+    $script:uploaded[0] | Should -Not -BeNullOrEmpty
+    $script:uploaded[0] | Should -Match '7'
+  }
+
+  It "posts the file to the project's attachment endpoint with the name in the query string" {
+    $script:asked = $null
+    Mock InvokeAdoUpload { $script:asked = $url; return [pscustomobject]@{ url = "https://ado/att/1" } }
+
+    NewAdoAttachment 'a b.pdf' ([byte[]]@(1)) | Should -Be "https://ado/att/1"
+
+    $script:asked | Should -BeLike '*/Migration/_apis/wit/attachments?fileName=a%20b.pdf*'
+  }
+}
+
+##################################################################################################
+# The four Epic attributes with no ADO field go to the description's Agility details block rather
+# than to custom fields: 28 Personas, 41 Risk, 6 Reference, 6 RequestedBy.
+##################################################################################################
+Describe "Agility details carries the fields with no ADO home" {
+
+  BeforeAll {
+    function NewDetailItem($props)
+    {
+      $base = @{ Timebox = $null; Personas = @(); Risk = $null; Reference = $null; RequestedBy = $null }
+      foreach ($k in $props.Keys) { $base[$k] = $props[$k] }
+      return [pscustomobject]$base
+    }
+  }
+
+  It "lists every persona, which is multi value in Agility" {
+    BuildAgilityDetails (NewDetailItem @{ Personas = @("Traditional Student", "Employee") }) |
+      Should -Match "Personas: Traditional Student, Employee"
+  }
+
+  It "carries the risk rating" {
+    BuildAgilityDetails (NewDetailItem @{ Risk = 9 }) | Should -Match "Risk: 9"
+  }
+
+  It "carries the reference" {
+    BuildAgilityDetails (NewDetailItem @{ Reference = "S-10474/ S-08233" }) |
+      Should -Match ([regex]::Escape("Reference: S-10474/ S-08233"))
+  }
+
+  # Free text, not an identity: two of the six hold several names and one is "ESM workgroup".
+  It "carries who requested it, as text" {
+    BuildAgilityDetails (NewDetailItem @{ RequestedBy = "Denise Aberle-Cannata, Kelly Steely" }) |
+      Should -Match ([regex]::Escape("Requested by: Denise Aberle-Cannata, Kelly Steely"))
+  }
+
+  It "puts them all in ONE Agility details block alongside the sprint" {
+    $html = BuildAgilityDetails (NewDetailItem @{ Timebox = "Sprint 3"; Risk = 2; Reference = "R-1" })
+
+    @([regex]::Matches($html, "Agility details")).Count | Should -Be 1
+    $html | Should -Match "Sprint: Sprint 3"
+    $html | Should -Match "Risk: 2"
+  }
+
+  It "html encodes the values so markup cannot break the description" {
+    BuildAgilityDetails (NewDetailItem @{ Reference = "<b>x</b>" }) | Should -Match "&lt;b&gt;x&lt;/b&gt;"
+  }
+
+  It "still returns nothing when the item has none of them" {
+    BuildAgilityDetails (NewDetailItem @{}) | Should -Be ""
+  }
+}
+
+##################################################################################################
+# Acceptance criteria are cloned out of the description into the real ADO field, and left in place.
+#
+# Measured across all 619 Epic descriptions: 100 carry an "Acceptance Criteria" heading, spelled
+# that way every time (case varies, trailing colon optional). 65 run to the end of the description
+# and 35 are followed by a "Constraints" heading, which is what bounds the section. There are NO
+# uses of "A/C", "Definition of Done" or "DoD", and the only two standalone "AC" tokens in the whole
+# corpus are prose about student records, not headings - which is why AC is matched only in heading
+# position with a colon.
+##################################################################################################
+Describe "ExtractAcceptanceCriteria" {
+
+  It "takes the list that follows a bold heading" {
+    ExtractAcceptanceCriteria '<p>intro</p><p><strong>Acceptance Criteria:</strong></p><ul><li>a</li></ul>' |
+      Should -Be '<ul><li>a</li></ul>'
+  }
+
+  It "takes the list that follows a plain paragraph heading" {
+    ExtractAcceptanceCriteria '<p>Acceptance Criteria:</p><ul><li>a</li><li>b</li></ul>' |
+      Should -Be '<ul><li>a</li><li>b</li></ul>'
+  }
+
+  # 35 of the 100 are followed by a Constraints heading. Everything after it belongs to that section.
+  It "stops at the next bold heading, so Constraints do not become criteria" {
+    ExtractAcceptanceCriteria '<p><strong>Acceptance Criteria:</strong></p><ul><li>a</li></ul><p><strong>Constraints:</strong></p><ul><li>b</li></ul>' |
+      Should -Be '<ul><li>a</li></ul>'
+  }
+
+  # Constraints is written WITHOUT bold on 13 Epics, and those leaked into the criteria until the
+  # plain-paragraph form was added as a terminator.
+  It "stops at a plain heading paragraph that ends in a colon" {
+    ExtractAcceptanceCriteria '<p>Acceptance Criteria:</p><ul><li>a</li></ul><p>Constraints:</p><ul><li>b</li></ul>' |
+      Should -Be '<ul><li>a</li></ul>'
+  }
+
+  It "stops at other plain sub-headings seen in the data" {
+    ExtractAcceptanceCriteria '<p>Acceptance Criteria:</p><ul><li>a</li></ul><p>NOTES:</p><p>b</p>' |
+      Should -Be '<ul><li>a</li></ul>'
+  }
+
+  # The colon alone must not end a section, or a criterion written as a sentence would truncate it.
+  # Only a SHORT paragraph counts as a heading.
+  It "does not treat a long sentence ending in a colon as a heading" {
+    $long = 'The following systems must each be verified by the operations team before release:'
+    ExtractAcceptanceCriteria "<p>Acceptance Criteria:</p><p>$long</p><ul><li>a</li></ul>" |
+      Should -Be "<p>$long</p><ul><li>a</li></ul>"
+  }
+
+  It "does not treat a plain paragraph with no colon as a heading" {
+    ExtractAcceptanceCriteria '<p>Acceptance Criteria:</p><ul><li>a</li></ul><p>still criteria</p>' |
+      Should -Be '<ul><li>a</li></ul><p>still criteria</p>'
+  }
+
+  It "runs to the end when nothing follows the section" {
+    ExtractAcceptanceCriteria '<p><strong>Acceptance Criteria</strong></p><ul><li>only</li></ul>' |
+      Should -Be '<ul><li>only</li></ul>'
+  }
+
+  It "matches whatever case the heading was written in" {
+    ExtractAcceptanceCriteria '<p>acceptance criteria:</p><ul><li>a</li></ul>' | Should -Be '<ul><li>a</li></ul>'
+    ExtractAcceptanceCriteria '<p>ACCEPTANCE CRITERIA</p><ul><li>a</li></ul>' | Should -Be '<ul><li>a</li></ul>'
+  }
+
+  It "matches a heading with no colon" {
+    ExtractAcceptanceCriteria '<p><strong>Acceptance Criteria</strong></p><p>must work</p>' | Should -Be '<p>must work</p>'
+  }
+
+  # 2 of the 100 headings sit inside a nested list, so the slice begins part way out of it and the
+  # section would otherwise start with closing tags it never opened. A section can never legitimately
+  # begin by closing something, so a leading run of them is always orphaned.
+  It "drops orphaned closing tags left by a heading inside a list" {
+    ExtractAcceptanceCriteria '<ol><li>Acceptance Criteria:</li></ol><ul><li>a</li></ul>' |
+      Should -Be '<ul><li>a</li></ul>'
+  }
+
+  It "trims trailing empty paragraphs" {
+    ExtractAcceptanceCriteria '<p>Acceptance Criteria:</p><ul><li>a</li></ul><p><br></p><p>&nbsp;</p>' |
+      Should -Be '<ul><li>a</li></ul>'
+  }
+
+  It "returns nothing when the description has no acceptance criteria" {
+    ExtractAcceptanceCriteria '<p>just a description</p>' | Should -BeNullOrEmpty
+  }
+
+  It "returns nothing for an empty or missing description" {
+    ExtractAcceptanceCriteria ''    | Should -BeNullOrEmpty
+    ExtractAcceptanceCriteria $null | Should -BeNullOrEmpty
+  }
+
+  # A heading with nothing under it must not write an empty field.
+  It "returns nothing when the section is empty" {
+    ExtractAcceptanceCriteria '<p><strong>Acceptance Criteria:</strong></p><p><br></p>' | Should -BeNullOrEmpty
+  }
+
+  # The ONLY two standalone "AC" tokens in all 619 descriptions are these, both prose about student
+  # record lines. Matching a bare AC would produce two false positives and zero true ones.
+  It "does not mistake AC in prose for a heading" {
+    ExtractAcceptanceCriteria '<p>sometimes after MTS their file stays at AC.</p><p>more text</p>' |
+      Should -BeNullOrEmpty
+    ExtractAcceptanceCriteria '<p>an AP line exists but no MS or AC line</p><ul><li>x</li></ul>' |
+      Should -BeNullOrEmpty
+  }
+
+  # AC IS honoured in heading position, which is what the abbreviation was asked for.
+  It "accepts AC as a heading when it is written as one" {
+    ExtractAcceptanceCriteria '<p><strong>AC:</strong></p><ul><li>a</li></ul>' | Should -Be '<ul><li>a</li></ul>'
+    ExtractAcceptanceCriteria '<p>AC:</p><ul><li>a</li></ul>'                  | Should -Be '<ul><li>a</li></ul>'
+  }
+
+  It "does not treat a lower case 'ac:' as the abbreviation" {
+    ExtractAcceptanceCriteria '<p>ac: something unrelated</p><ul><li>x</li></ul>' | Should -BeNullOrEmpty
+  }
+}
+
+Describe "Acceptance criteria reach the ADO field" {
+
+  BeforeAll {
+    $script:mappings = [pscustomobject]@{
+      RequiredFields = [pscustomobject]@{
+        AgilityId = "Custom.DigitalAIID"; AgilityStatus = "Custom.DigitalAIStatus"
+        AgilityCategory = "Custom.DigitalAICategory"; AgilityFY = "Custom.DigitalAIFY"
+      }
+      CustomFields = [pscustomobject]@{
+        AcceptanceCriteria = [pscustomobject]@{
+          Field = "Microsoft.VSTS.Common.AcceptanceCriteria"
+          AdoTypes = @("Epic", "Feature", "Product Backlog Item", "Bug")
+        }
+      }
+      Fields     = [pscustomobject]@{}
+      States     = [pscustomobject]@{ Epic = [pscustomobject]@{ DefaultState = "New"; ClosedState = "Done"; Map = [pscustomobject]@{} } }
+      Priorities = [pscustomobject]@{ DefaultPriority = 2; Map = [pscustomobject]@{} }
+    }
+    $script:config = [pscustomobject]@{ AzureDevOps = [pscustomobject]@{ Project = "Migration" } }
+
+    function NewAcItem($adoType, $description)
+    {
+      return [pscustomobject]@{
+        AgilityType = "Epic"; Number = "E-1"; Name = "epic"; AdoType = $adoType
+        AssetState = 64; Status = $null; Description = $description
+        OwnerNames = @(); OwnerEmails = @(); AreaPath = ""
+        FiscalYears = @(); Mandates = @(); StrategicThemes = @(); AgilityTags = @()
+      }
+    }
+    function ValueAt($patch, $path) { @($patch | Where-Object { $_.path -eq $path })[0].value }
+  }
+
+  It "clones the criteria out of the description into the field" {
+    $patch = BuildFieldPatch (NewAcItem 'Epic' '<p><strong>Acceptance Criteria:</strong></p><ul><li>a</li></ul>')
+
+    ValueAt $patch "/fields/Microsoft.VSTS.Common.AcceptanceCriteria" | Should -Be '<ul><li>a</li></ul>'
+  }
+
+  # A clone, not a move: the user asked for it to stay in the description too.
+  It "leaves the criteria in the description as well" {
+    $patch = BuildFieldPatch (NewAcItem 'Epic' '<p><strong>Acceptance Criteria:</strong></p><ul><li>a</li></ul>')
+
+    ValueAt $patch "/fields/System.Description" | Should -Match ([regex]::Escape('<li>a</li>'))
+    ValueAt $patch "/fields/System.Description" | Should -Match "Acceptance Criteria"
+  }
+
+  It "writes nothing when the description has no criteria" {
+    $patch = BuildFieldPatch (NewAcItem 'Epic' '<p>plain</p>')
+
+    @($patch | Where-Object { $_.path -like "*AcceptanceCriteria*" }) | Should -BeNullOrEmpty
+  }
+
+  # Task and Impediment have no such field, and ADO would accept the write and drop it silently.
+  It "does not write the field on a type that does not have it" {
+    $patch = BuildFieldPatch (NewAcItem 'Task' '<p>Acceptance Criteria:</p><ul><li>a</li></ul>')
+
+    @($patch | Where-Object { $_.path -like "*AcceptanceCriteria*" }) | Should -BeNullOrEmpty
+  }
+}
+
+##################################################################################################
+# Follow-ups from the Epic field audit (2026-07-30). Measured against all 877 Epics in the five
+# configured scopes; every count in these comments is from that measurement, not an estimate.
+##################################################################################################
+Describe "Multi-value fiscal year and mandate are no longer truncated" {
+
+  BeforeAll {
+    $script:mappings = [pscustomobject]@{
+      RequiredFields = [pscustomobject]@{
+        AgilityId = "Custom.DigitalAIID"; AgilityStatus = "Custom.DigitalAIStatus"
+        AgilityCategory = "Custom.DigitalAICategory"; AgilityFY = "Custom.DigitalAIFY"
+      }
+      CustomFields = [pscustomobject]@{
+        Mandate = [pscustomobject]@{ Field = "Custom.DigitalAIMandate"; AdoTypes = @("Epic", "Feature") }
+      }
+      Fields     = [pscustomobject]@{}
+      States     = [pscustomobject]@{ Epic = [pscustomobject]@{ DefaultState = "New"; ClosedState = "Done"; Map = [pscustomobject]@{} } }
+      Priorities = [pscustomobject]@{ DefaultPriority = 2; Map = [pscustomobject]@{} }
+    }
+    $script:config = [pscustomobject]@{ AzureDevOps = [pscustomobject]@{ Project = "Migration" } }
+
+    function NewFyItem($fys, $mandates)
+    {
+      return [pscustomobject]@{
+        AgilityType = "Epic"; Number = "E-1"; Name = "epic"; AdoType = "Epic"
+        AssetState = 64; Status = $null; FiscalYears = $fys; Mandates = $mandates
+        OwnerNames = @(); OwnerEmails = @(); AreaPath = ""; Category = $null
+        StrategicThemes = @(); AgilityTags = @()
+      }
+    }
+    function ValueAt($patch, $path) { @($patch | Where-Object { $_.path -eq $path })[0].value }
+  }
+
+  # 42 of the 114 Epics with a fiscal year have more than one (27x2, 13x3, 2x4). Reading only the
+  # first dropped 59 values; E-05100 really does carry FY 21, FY 22, FY 20 and FY 23.
+  It "writes every fiscal year, not just the first" {
+    ValueAt (BuildFieldPatch (NewFyItem @("FY 21", "FY 22", "FY 20") @())) "/fields/Custom.DigitalAIFY" |
+      Should -Be "FY 21; FY 22; FY 20"
+  }
+
+  It "writes a single fiscal year without a separator" {
+    ValueAt (BuildFieldPatch (NewFyItem @("FY 23") @())) "/fields/Custom.DigitalAIFY" | Should -Be "FY 23"
+  }
+
+  # The field is written on every item even when empty, so it always means something.
+  It "still writes an empty fiscal year when there is none" {
+    ValueAt (BuildFieldPatch (NewFyItem @() @())) "/fields/Custom.DigitalAIFY" | Should -Be ""
+  }
+
+  # 2 of the 90 Epics with a mandate carry two.
+  It "writes every mandate, not just the first" {
+    ValueAt (BuildFieldPatch (NewFyItem @() @("Vendor Requirement", "Federal"))) "/fields/Custom.DigitalAIMandate" |
+      Should -Be "Vendor Requirement; Federal"
+  }
+
+  It "omits the mandate field entirely when there is no mandate" {
+    @((BuildFieldPatch (NewFyItem @() @())) | Where-Object { $_.path -like "*Mandate*" }) | Should -BeNullOrEmpty
+  }
+}
+
+Describe "Epic extras the audit found: parser" {
+
+  BeforeAll {
+    function EpicPayload($attributes)
+    {
+      return [pscustomobject]@{ Assets = @([pscustomobject]@{ id = "Epic:1"; Attributes = [pscustomobject]$attributes }) }
+    }
+    function Attr($value) { return [pscustomobject]@{ value = $value } }
+  }
+
+  It "reads every fiscal year and mandate as a list" {
+    $parsed = ConvertFromAgilityAssets (EpicPayload @{
+      'Custom_FiscalYear.Name' = Attr @("FY 21", "FY 22")
+      'Custom_Mandate.Name'    = Attr @("Vendor Requirement", "Federal")
+    }) 'Epic'
+
+    $parsed[0].FiscalYears | Should -Be @("FY 21", "FY 22")
+    $parsed[0].Mandates    | Should -Be @("Vendor Requirement", "Federal")
+  }
+
+  # 27 Epics carry Agility's own tag list, up to 5 tags each.
+  It "reads TaggedWith, Agility's own tag list" {
+    $parsed = ConvertFromAgilityAssets (EpicPayload @{ TaggedWith = Attr @("IT", "Phishing") }) 'Epic'
+
+    $parsed[0].AgilityTags | Should -Be @("IT", "Phishing")
+  }
+
+  # 20 Epics depend on another Epic and 16 are depended on; both carry .Number.
+  It "reads the dependency numbers at both ends" {
+    $parsed = ConvertFromAgilityAssets (EpicPayload @{
+      'Dependencies.Number' = Attr @("E-05908", "E-05909")
+      'Dependants.Number'   = Attr @("E-05911")
+    }) 'Epic'
+
+    $parsed[0].DependencyNumbers | Should -Be @("E-05908", "E-05909")
+    $parsed[0].DependantNumbers  | Should -Be @("E-05911")
+  }
+
+  It "reads the person who closed the Epic" {
+    $parsed = ConvertFromAgilityAssets (EpicPayload @{
+      'ClosedBy.Name'  = Attr "Richard Goldsberry"
+      'ClosedBy.Email' = Attr "rgoldsberry@example.com"
+    }) 'Epic'
+
+    $parsed[0].ClosedByName  | Should -Be "Richard Goldsberry"
+    $parsed[0].ClosedByEmail | Should -Be "rgoldsberry@example.com"
+  }
+
+  # Links.URL and Links.Name are two lists read off ONE relation, so index i must mean the same link
+  # in both. This is the Owners null-padding trap: a link with no name would slide every later URL up
+  # a slot if the nulls were stripped.
+  It "keeps link urls and names aligned when one has no name" {
+    $parsed = ConvertFromAgilityAssets (EpicPayload @{
+      'Links.URL'  = Attr @("https://a", "https://b", "https://c")
+      'Links.Name' = Attr @("A", $null, "C")
+    }) 'Epic'
+
+    @($parsed[0].LinkUrls).Count  | Should -Be 3
+    @($parsed[0].LinkNames).Count | Should -Be 3
+    @($parsed[0].LinkNames)[2]    | Should -Be "C"
+  }
+}
+
+Describe "Epic extras the audit found: tags" {
+
+  BeforeAll {
+    $script:mappings = [pscustomobject]@{ Tags = [pscustomobject]@{} }
+
+    function NewTagItem($props)
+    {
+      $base = @{
+        ParentUnresolved = $false; ParentNumberForTag = $null; BlockedUnresolved = @()
+        Source = $null; AgilityTags = @(); DependencyUnresolved = @()
+      }
+      foreach ($k in $props.Keys) { $base[$k] = $props[$k] }
+      return [pscustomobject]$base
+    }
+  }
+
+  # Agility's own tags belong in System.Tags, which the tool already writes.
+  It "carries Agility's TaggedWith values into System.Tags" {
+    BuildTags (NewTagItem @{ AgilityTags = @("AV", "Classroom") }) | Should -Be "AV; Classroom"
+  }
+
+  # ADO separates tags with semicolons, so one inside a value would split it into two tags.
+  It "replaces a semicolon inside an Agility tag" {
+    BuildTags (NewTagItem @{ AgilityTags = @("a;b") }) | Should -Be "a,b"
+  }
+
+  # 93 Epics carry a Source. BuildTags was always type-agnostic; only the selection was missing it.
+  It "tags an Epic's Source, now that the selection asks for it" {
+    BuildTags (NewTagItem @{ Source = "Employees" }) | Should -Be "agility-source:Employees"
+  }
+
+  It "tags a dependency that is not in Azure DevOps, so the relationship is not lost" {
+    BuildTags (NewTagItem @{ DependencyUnresolved = @("E-09999") }) | Should -Be "agility-depends:E-09999"
+  }
+
+  It "still produces nothing for an item with nothing worth tagging" {
+    BuildTags (NewTagItem @{}) | Should -Be ""
+  }
+}
+
+Describe "Epic dependencies become Successor and Predecessor links" {
+
+  BeforeAll {
+    $script:mappings = [pscustomobject]@{
+      LinkTypes = [pscustomobject]@{
+        Parent      = "System.LinkTypes.Hierarchy-Reverse"
+        Related     = "System.LinkTypes.Related"
+        Blocks      = "Microsoft.VSTS.Common.Affects-Forward"
+        Successor   = "System.LinkTypes.Dependency-Forward"
+        Predecessor = "System.LinkTypes.Dependency-Reverse"
+      }
+    }
+    $script:DryRun = $false
+    $script:DryRunPendingId = 'would-be-created-by-this-run'
+
+    function NewDepItem($deps, $dependants)
+    {
+      return [pscustomobject]@{ DependencyNumbers = $deps; DependantNumbers = $dependants }
+    }
+  }
+
+  It "resolves a dependency that is already in Azure DevOps" {
+    $r = ResolveDependencyIds (NewDepItem @("E-2") @()) @{ "E-2" = 101 }
+
+    $r.Successors   | Should -Be @(101)
+    $r.Predecessors | Should -BeNullOrEmpty
+    $r.Unresolved   | Should -BeNullOrEmpty
+  }
+
+  It "resolves the other end as a predecessor" {
+    $r = ResolveDependencyIds (NewDepItem @() @("E-3")) @{ "E-3" = 202 }
+
+    $r.Predecessors | Should -Be @(202)
+  }
+
+  # An Epic outside the configured scopes keeps its number as a tag, the same as an unmigrated parent.
+  It "reports a dependency that is not in Azure DevOps as unresolved" {
+    $r = ResolveDependencyIds (NewDepItem @("E-9") @()) @{}
+
+    $r.Successors | Should -BeNullOrEmpty
+    $r.Unresolved | Should -Be @("E-9")
+  }
+
+  # A dry run creates nothing, so a target this run WOULD create must not be reported as a miss.
+  It "does not count an item this run would create as unresolved" {
+    $r = ResolveDependencyIds (NewDepItem @("E-4") @()) @{ "E-4" = $script:DryRunPendingId }
+
+    $r.Unresolved  | Should -BeNullOrEmpty
+    $r.Successors  | Should -BeNullOrEmpty
+  }
+}
+
+##################################################################################################
+# Dependency links must NOT ride in the create (fixed 2026-08-01, after it lost 4 Stories).
+#
+# Agility lets dependency graphs contain cycles; ADO's Dependency link type does not. A cyclic link
+# inside the create patch makes ADO reject the WHOLE create with TF201035, so the work item is never
+# made at all - "Adding a Successor link between work items -1 and 111216 would result in a circular
+# relationship". The -1 is the item being created, which is how we know it was the create.
+#
+# So the links are added AFTER the item exists, in their own non-fatal patch: one call per item, and
+# if that batch is rejected each link is retried alone so only the genuinely cyclic one is dropped.
+##################################################################################################
+Describe "Dependency links are added after the create, never inside it" {
+
+  BeforeAll {
+    $script:mappings = [pscustomobject]@{
+      LinkTypes = [pscustomobject]@{
+        Parent      = "System.LinkTypes.Hierarchy-Reverse"
+        Related     = "System.LinkTypes.Related"
+        Blocks      = "Microsoft.VSTS.Common.Affects-Forward"
+        Successor   = "System.LinkTypes.Dependency-Forward"
+        Predecessor = "System.LinkTypes.Dependency-Reverse"
+      }
+    }
+    $script:config = [pscustomobject]@{ AzureDevOps = [pscustomobject]@{ OrganizationUrl = "https://dev.azure.com/org" } }
+
+    function Deps($successors, $predecessors)
+    {
+      return [pscustomobject]@{ Successors = $successors; Predecessors = $predecessors; Unresolved = @() }
+    }
+  }
+
+  BeforeEach { $script:DryRun = $false; $script:warnings = 0; $script:patches = @() }
+
+  # The create must be incapable of failing on a cycle, because a failed create loses the item.
+  It "keeps dependency relations out of the create payload" {
+    $source = Get-Content $script:scriptPath -Raw
+    $body = [regex]::Match($source, "function NewAdoWorkItem\b[\s\S]*?(?=\r?\nfunction )").Value
+
+    $body | Should -Not -Match 'LinkTypes\.Successor'   -Because "a cyclic Successor in the create kills the whole item"
+    $body | Should -Not -Match 'LinkTypes\.Predecessor'
+  }
+
+  It "recognises the circular link rejection" {
+    IsCircularLinkProblem 'TF201035: Adding a Successor link between work items -1 and 111216 would result in a circular relationship.' |
+      Should -BeTrue
+    IsCircularLinkProblem 'TF401320: Rule Error for field Closed By.' | Should -BeFalse
+  }
+
+  It "patches Successor and Predecessor links after the item exists" {
+    Mock InvokeAdoRequest { $script:patches += ,$body }
+
+    AddAdoDependencyLinks 42 ([pscustomobject]@{ Number = 'S-1' }) (Deps @(101) @(202))
+
+    @($script:patches).Count | Should -Be 1 -Because "one batched call per item is the common case"
+    $ops = $script:patches[0]
+    @($ops).Count | Should -Be 2
+    $ops[0].value.rel | Should -Be 'System.LinkTypes.Dependency-Forward'
+    $ops[0].value.url | Should -BeLike '*101'
+    $ops[1].value.rel | Should -Be 'System.LinkTypes.Dependency-Reverse'
+  }
+
+  It "does nothing when the item has no dependencies" {
+    Mock InvokeAdoRequest { $script:patches += ,$body }
+
+    AddAdoDependencyLinks 42 ([pscustomobject]@{ Number = 'S-1' }) (Deps @() @())
+
+    @($script:patches).Count | Should -Be 0
+  }
+
+  # The whole point: a cycle must cost one LINK, not the work item and not its other links.
+  It "retries links one at a time when the batch is rejected, keeping the good ones" {
+    $script:attempt = 0
+    Mock InvokeAdoRequest {
+      $script:attempt++
+      $script:patches += ,$body
+      # The batch and then the link to 999 are cyclic; the others must still go in.
+      if ($script:attempt -eq 1) { throw "TF201035: circular relationship" }
+      if (@($body)[0].value.url -like '*999') { throw "TF201035: circular relationship" }
+    }
+
+    { AddAdoDependencyLinks 42 ([pscustomobject]@{ Number = 'S-1' }) (Deps @(101, 999, 103) @()) } |
+      Should -Not -Throw
+
+    # 1 batch + 3 individual retries.
+    @($script:patches).Count | Should -Be 4
+    $script:warnings | Should -BeGreaterThan 0 -Because "the dropped link must be reported"
+  }
+
+  # A failure here must never cost the item, which already exists by this point.
+  It "warns rather than throwing when a link cannot be added at all" {
+    Mock InvokeAdoRequest { throw "something else entirely" }
+
+    { AddAdoDependencyLinks 42 ([pscustomobject]@{ Number = 'S-1' }) (Deps @(101) @()) } | Should -Not -Throw
+    $script:warnings | Should -BeGreaterThan 0
+  }
+
+  It "writes nothing on a dry run" {
+    $script:DryRun = $true
+    Mock InvokeAdoRequest { $script:patches += ,$body }
+
+    AddAdoDependencyLinks 42 ([pscustomobject]@{ Number = 'S-1' }) (Deps @(101) @())
+
+    @($script:patches).Count | Should -Be 0
+  }
+}
+
+Describe "Epic links and closer reach Azure DevOps" {
+
+  BeforeAll {
+    $script:mappings = [pscustomobject]@{
+      Fields    = [pscustomobject]@{ ClosedBy = "Microsoft.VSTS.Common.ClosedBy" }
+      LinkTypes = [pscustomobject]@{
+        Parent      = "System.LinkTypes.Hierarchy-Reverse"
+        Related     = "System.LinkTypes.Related"
+        Blocks      = "Microsoft.VSTS.Common.Affects-Forward"
+        Successor   = "System.LinkTypes.Dependency-Forward"
+        Predecessor = "System.LinkTypes.Dependency-Reverse"
+      }
+    }
+    $script:config = [pscustomobject]@{ AzureDevOps = [pscustomobject]@{ OrganizationUrl = "https://dev.azure.com/org" } }
+    # Off, so an uncached identity is assumed assignable and no probe is attempted.
+    $script:ProbeAssignability = $false
+    $script:assignableCache = @{}
+  }
+
+  # 3 of the 5 links are https; the other two are I:\ file-share paths, which ADO's Hyperlink
+  # relation cannot take. They must not be silently dropped.
+  It "makes a hyperlink out of an http url" {
+    # Wrapped, because a one element array unrolls to the bare hashtable on the way out.
+    $ops = @(BuildHyperlinkOps ([pscustomobject]@{ LinkUrls = @("https://example.com/doc"); LinkNames = @("A doc") }))
+
+    $ops.Count          | Should -Be 1
+    $ops[0].path        | Should -Be "/relations/-"
+    $ops[0].value.rel   | Should -Be "Hyperlink"
+    $ops[0].value.url   | Should -Be "https://example.com/doc"
+    $ops[0].value.attributes.comment | Should -Be "A doc"
+  }
+
+  It "does not try to hyperlink a file share path, which ADO would reject" {
+    BuildHyperlinkOps ([pscustomobject]@{ LinkUrls = @("I:\IT Private\EAS"); LinkNames = @("Share") }) |
+      Should -BeNullOrEmpty
+  }
+
+  It "keeps an unlinkable path in the description instead of dropping it" {
+    $description = BuildDescription ([pscustomobject]@{
+      Description = "body"; Number = "E-1"
+      LinkUrls = @("I:\IT Private\EAS"); LinkNames = @("Share")
+    }) $null
+
+    $description | Should -Match ([regex]::Escape("I:\IT Private\EAS"))
+  }
+
+  It "does not add a links block when every link became a hyperlink" {
+    $description = BuildDescription ([pscustomobject]@{
+      Description = "body"; Number = "E-1"
+      LinkUrls = @("https://example.com"); LinkNames = @("A")
+    }) $null
+
+    $description | Should -Not -Match "Agility links"
+  }
+
+  # Microsoft.VSTS.Common.ClosedBy exists on Epic and Feature and is writable, verified live. It is
+  # an IDENTITY field, so it goes in a rule-checked patch: under bypassRules ADO would store a
+  # departed closer as an unresolvable historical identity, exactly the AssignedTo hazard.
+  It "prefers the closer's email over their name" {
+    ResolveClosedBy ([pscustomobject]@{ ClosedByEmail = "a@example.com"; ClosedByName = "A B" }) |
+      Should -Be "a@example.com"
+  }
+
+  It "falls back to the closer's name when there is no email" {
+    ResolveClosedBy ([pscustomobject]@{ ClosedByEmail = $null; ClosedByName = "A B" }) | Should -Be "A B"
+  }
+
+  # 406 of the 773 closers are not org members (Brittney Trimmer alone closed 311). Writing one would
+  # fail the patch, so an unassignable closer is skipped and the item keeps everything else.
+  It "returns nothing for a closer Azure DevOps will not accept" {
+    $script:assignableCache = @{ "gone@example.com" = $false }
+
+    ResolveClosedBy ([pscustomobject]@{ ClosedByEmail = "gone@example.com"; ClosedByName = $null }) |
+      Should -BeNullOrEmpty
+  }
+
+  # Closed By is READ ONLY under process rules, so a rule-checked patch is rejected outright with
+  # TF401320 "ReadOnly, AllowsOldValue, InvalidNotOldValue". That failed 161 Epics on a real run: the
+  # item was created, transitioned, assigned, and only then died on this field.
+  #
+  # It therefore rides in the bypassRules CREATE, which is verified to persist through the later
+  # transition and the rule-checked assignee patch after it. What makes bypass safe here is
+  # ResolveClosedBy: bypass skips identity validation, so the assignability filter is the only thing
+  # standing between a departed closer and an unresolvable stored identity. Do not remove it.
+  It "carries the closer in the bypassRules create" {
+    $op = BuildClosedByOp ([pscustomobject]@{ ClosedByEmail = "a@example.com"; ClosedByName = $null })
+
+    $op.path  | Should -Be "/fields/Microsoft.VSTS.Common.ClosedBy"
+    $op.value | Should -Be "a@example.com"
+  }
+
+  It "produces no closer op when there is nobody usable" {
+    BuildClosedByOp ([pscustomobject]@{ ClosedByEmail = $null; ClosedByName = $null }) | Should -BeNullOrEmpty
+  }
+
+  It "produces no closer op for an identity Azure DevOps rejects" {
+    $script:assignableCache = @{ "gone@example.com" = $false }
+
+    BuildClosedByOp ([pscustomobject]@{ ClosedByEmail = "gone@example.com"; ClosedByName = $null }) |
+      Should -BeNullOrEmpty
+  }
+
+  # A rule-checked validateOnly REJECTS Closed By (verified live: "AllowsOldValue, InvalidNotEmpty"),
+  # and BuildFieldPatch is shared with the dry run. Putting it there would make every dry run report
+  # INVALID on every closed item.
+  It "keeps the closer OUT of the shared field patch, which the dry run validates rule-checked" {
+    $source = Get-Content $script:scriptPath -Raw
+    function BodyOf($src, $name) { [regex]::Match($src, "function $name\b[\s\S]*?(?=\r?\nfunction )").Value }
+
+    (BodyOf $source 'BuildFieldPatch') | Should -Not -Match 'Fields\.ClosedBy' `
+      -Because "a rule-checked validateOnly rejects Closed By outright"
+  }
+
+  It "adds the closer op to the create, which is the bypass payload" {
+    $source = Get-Content $script:scriptPath -Raw
+    function BodyOf($src, $name) { [regex]::Match($src, "function $name\b[\s\S]*?(?=\r?\nfunction )").Value }
+
+    $create = BodyOf $source 'NewAdoWorkItem'
+    $create | Should -Match 'BuildClosedByOp'
+    $create | Should -Match 'bypassRules=true'
+  }
+
+  # The whole point of the rewrite: nothing may patch Closed By outside the bypass create.
+  It "has no rule-checked patch of the closer left anywhere" {
+    $source = Get-Content $script:scriptPath -Raw
+
+    $source | Should -Not -Match 'function SetAdoClosedBy' `
+      -Because "the separate rule-checked patch is what TF401320 rejected"
+  }
 }
 
 Describe "Logging" {
@@ -2727,6 +4107,22 @@ Describe "Agility is read only" {
     $source | Should -Match 'function InvokeAgilityGet[\s\S]*?-Method Get'
   }
 
+  # Attachments need raw bytes, which the JSON reader cannot return, so there is a SECOND door to
+  # Agility. It carries the same guarantee: Get is hard coded and there is no method parameter.
+  It "hard codes -Method Get in the attachment download too" {
+    $source = Get-Content $script:scriptPath -Raw
+
+    $source | Should -Match 'function InvokeAgilityDownload[\s\S]*?-Method Get'
+    $source | Should -Not -Match 'function InvokeAgilityDownload\([^)]*\$method'
+  }
+
+  It "never sends a write verb to the attachment endpoint" {
+    $lines = Get-Content $script:scriptPath
+
+    @($lines | Where-Object { $_ -match 'attachment\.img' -and $_ -match '-Method\s+(Post|Put|Delete|Patch)' }) |
+      Should -BeNullOrEmpty
+  }
+
   It "has no Agility call site outside InvokeAgilityGet" {
     # Any Agility write would have to construct a non Get call against the rest-1.v1 endpoint.
     # Assert that rest-1.v1 only ever appears on a URL built for InvokeAgilityGet.
@@ -2811,7 +4207,6 @@ Describe "MaterializeOwners: add recoverable owners to the org as free Stakehold
         }
         return [pscustomobject]@{ Assets = @() }
       }
-      $script:IncludeClosed = $true
 
       $owners = GetDistinctOwners @('Story')
 
@@ -2832,25 +4227,100 @@ Describe "MaterializeOwners: add recoverable owners to the org as free Stakehold
   }
 }
 
-Describe "DeleteAllTasks: remove ONLY Tasks, so they can be re-migrated" {
+##################################################################################################
+# The delete helpers: one per ADO work item type, over a shared core.
+#
+# What must never regress is what the type filter is FOR. These destroy permanently, so a query that
+# lost its type clause would take the whole project with it - the same class of hazard as the
+# AssetState filter on the Agility side, where dropping it would have migrated 18 templates.
+##################################################################################################
+Describe "Delete helpers: remove ONLY one type, so it can be re-migrated" {
 
   BeforeAll {
-    $script:config = [pscustomobject]@{ AzureDevOps = [pscustomobject]@{ OrganizationUrl = "https://dev.azure.com/contoso"; Project = "Migration" } }
+    $script:testConfig = [pscustomobject]@{
+      AzureDevOps = [pscustomobject]@{ OrganizationUrl = "https://dev.azure.com/contoso"; Project = "Migration" }
+    }
+    $script:config = $script:testConfig
+
+    # The query each wrapper actually sends, with nothing deleted.
+    function QueryOf([scriptblock]$call)
+    {
+      $script:queries = @()
+      Mock InvokeAdoRequest { $script:queries += $body.query; return [pscustomobject]@{ workItems = @() } }
+      & $call
+      return $script:queries[0]
+    }
   }
 
-  # The one thing that must never regress: it deletes Tasks and nothing else, and it destroys (the
-  # rerun needs them gone from WIQL, not sitting in the recycle bin under their DigitalAIID).
-  It "queries only Task work items and deletes with destroy=true" {
+  # These call the real entry points, which read config, resolve credentials and open a log. Stub all
+  # three: a unit test must not touch the credential store, the live instance, or the logs directory.
+  BeforeEach {
+    Mock GetConfig       { return $script:testConfig }
+    Mock BuildAdoHeaders { return @{ Authorization = "Basic test" } }
+    Mock StartLog        { }
+    Mock WriteLog        { }
+    Mock WriteLogDetail  { }
+  }
+
+  It "sends a work item type filter for every wrapper, and the right one" {
+    $expected = @{
+      'DeleteAllEpics'               = 'Epic'
+      'DeleteAllFeatures'            = 'Feature'
+      'DeleteAllProductBacklogItems' = 'Product Backlog Item'
+      'DeleteAllBugs'                = 'Bug'
+      'DeleteAllTasks'               = 'Task'
+      'DeleteAllImpediments'         = 'Impediment'
+    }
+
+    foreach ($fn in $expected.Keys)
+    {
+      $query = QueryOf ([scriptblock]::Create("$fn -DryRun"))
+
+      $query | Should -Match ([regex]::Escape("[System.WorkItemType] = '$($expected[$fn])'")) `
+        -Because "$fn must delete only $($expected[$fn])"
+    }
+  }
+
+  # A wrapper must never match a type that is not its own.
+  It "never matches another type" {
+    (QueryOf { DeleteAllEpics -DryRun })    | Should -Not -Match "'Feature'"
+    (QueryOf { DeleteAllFeatures -DryRun }) | Should -Not -Match "'Epic'"
+    (QueryOf { DeleteAllBugs -DryRun })     | Should -Not -Match "'Task'"
+  }
+
+  # The rail that replaces "the type is hard coded": an unrecognised type must stop, not run a query
+  # with a filter that matches everything or nothing by accident.
+  It "throws on an unknown type rather than querying without a real filter" {
+    { DeleteAllOfType 'Widget' -DryRun } | Should -Throw -ExpectedMessage "*Widget*"
+    { DeleteAllOfType '' -DryRun }       | Should -Throw
+  }
+
+  It "always scopes to the configured project as well as the type" {
+    (QueryOf { DeleteAllTasks -DryRun }) | Should -Match "\[System\.TeamProject\] = 'Migration'"
+  }
+
+  It "destroys rather than recycling, so a rerun cannot find them by DigitalAIID" {
     $source = Get-Content $script:scriptPath -Raw
-    $getBody    = [regex]::Match($source, "function GetAllTaskIds\b[\s\S]*?(?=\r?\nfunction )").Value
-    $deleteBody = [regex]::Match($source, "function DeleteAllTasks\b[\s\S]*?(?=\r?\nfunction )").Value
+    $body = [regex]::Match($source, "function DeleteAllOfType\b[\s\S]*?(?=\r?\nfunction )").Value
 
-    $getBody    | Should -Match "System\.WorkItemType\] = 'Task'"
-    $deleteBody | Should -Match 'destroy=true'
-    $deleteBody | Should -Match "InvokeAdoRequest .* `"Delete`""
+    $body | Should -Match 'destroy=true'
+    $body | Should -Match "InvokeAdoRequest .* `"Delete`""
   }
 
-  It "walks every Task with a System.Id watermark, past the 20,000 row WIQL cap" {
+  It "deletes nothing on a dry run" {
+    $script:calls = @()
+    Mock InvokeAdoRequest {
+      $script:calls += $method
+      if ($method -eq 'Post') { return [pscustomobject]@{ workItems = @([pscustomobject]@{ id = 1 }) } }
+      return $null
+    }
+
+    DeleteAllEpics -DryRun
+
+    $script:calls | Should -Not -Contain 'Delete'
+  }
+
+  It "walks every item with a System.Id watermark, past the 20,000 row WIQL cap" {
     # Two full pages of 1000, then a short page, then it stops. Ids are unique and ascending.
     $script:call = 0
     Mock InvokeAdoRequest {
@@ -2860,7 +4330,7 @@ Describe "DeleteAllTasks: remove ONLY Tasks, so they can be re-migrated" {
       return [pscustomobject]@{ workItems = @(1..$count | ForEach-Object { [pscustomobject]@{ id = $start + $_ } }) }
     }
 
-    $ids = GetAllTaskIds
+    $ids = GetAllIdsOfType 'Task'
 
     @($ids).Count | Should -Be 2003
     $ids[-1] | Should -Be 2003 -Because "the watermark keeps advancing past 20k"
@@ -2875,9 +4345,15 @@ Describe "DeleteAllTasks: remove ONLY Tasks, so they can be re-migrated" {
       return [pscustomobject]@{ workItems = @() }
     }
 
-    GetAllTaskIds | Out-Null
+    GetAllIdsOfType 'Task' | Out-Null
 
     $script:queries[0] | Should -Match 'System\.Id\] > 0'
     $script:queries[1] | Should -Match 'System\.Id\] > 1000'
+  }
+
+  # 'Product Backlog Item' contains spaces; the WIQL quoting has to survive that.
+  It "handles a type name with spaces" {
+    (QueryOf { DeleteAllProductBacklogItems -DryRun }) |
+      Should -Match ([regex]::Escape("[System.WorkItemType] = 'Product Backlog Item'"))
   }
 }

@@ -25,6 +25,7 @@
     "PlannedEnd": "Microsoft.VSTS.Scheduling.TargetDate",
     "Order": "Microsoft.VSTS.Common.BacklogPriority",
     "ClosedDate": "Microsoft.VSTS.Common.ClosedDate",
+    "ClosedBy": "Microsoft.VSTS.Common.ClosedBy",
     "Environment": "Microsoft.VSTS.TCM.SystemInfo",
     "FoundInBuild": "Microsoft.VSTS.Build.FoundIn"
   },
@@ -37,14 +38,15 @@
     "AgilityFY": "Custom.DigitalAIFY"
   },
 
-  "_comment_CustomFields": "Custom fields that exist on only SOME work item types. Each lists the ADO types it lives on; BuildFieldPatch writes it only there and AssertFieldsExist checks the same set. StrategicTheme uses the Microsoft DevLabs multi-value control (stored as a semicolon-separated string). BugResolution/ImpedimentResolution carry the source ResolutionReason for Defect/Issue.",
+  "_comment_CustomFields": "Fields that exist on only SOME work item types. Each lists the ADO types it lives on; BuildFieldPatch writes it only there and AssertFieldsExist checks the same set. StrategicTheme uses the Microsoft DevLabs multi-value control (stored as a semicolon-separated string). BugResolution/ImpedimentResolution carry the source ResolutionReason for Defect/Issue. AcceptanceCriteria is a stock Microsoft.VSTS field rather than a custom one, listed here because Task and Impediment do not have it; it is filled by parsing an 'Acceptance Criteria' heading out of the description, since the source system has no acceptance criteria attribute.",
   "CustomFields": {
     "Owners":               { "Field": "Custom.DigitalAIOwners",               "AdoTypes": ["Epic", "Feature", "Product Backlog Item", "Bug", "Task", "Impediment"] },
     "Team":                 { "Field": "Custom.DigitalAITeam",                 "AdoTypes": ["Epic", "Feature", "Product Backlog Item", "Bug", "Task", "Impediment"] },
     "Mandate":              { "Field": "Custom.DigitalAIMandate",              "AdoTypes": ["Epic", "Feature"] },
     "StrategicTheme":       { "Field": "Custom.DigitalAIStrategicTheme",       "AdoTypes": ["Epic", "Feature"] },
     "BugResolution":        { "Field": "Custom.DigitalAIBugResolution",        "AdoTypes": ["Bug"] },
-    "ImpedimentResolution": { "Field": "Custom.DigitalAIImpedimentResolution", "AdoTypes": ["Impediment"] }
+    "ImpedimentResolution": { "Field": "Custom.DigitalAIImpedimentResolution", "AdoTypes": ["Impediment"] },
+    "AcceptanceCriteria":   { "Field": "Microsoft.VSTS.Common.AcceptanceCriteria", "AdoTypes": ["Epic", "Feature", "Product Backlog Item", "Bug"] }
   },
 
   "_comment_ValueMaps": "EXAMPLES - replace with your org's values. Source raw value -> cleaned ADO dropdown value. Match is trim-then-exact and CASE SENSITIVE. A value NOT in its map is not written; it is recorded in the field-value warnings (id, type, map, raw) so a new value surfaces rather than being silently dropped. Use these to normalize messy source values, fix spelling, or consolidate duplicates onto one canonical value.",
@@ -58,32 +60,46 @@
     "Duplicate Of Goal One": "Example Goal One"
   },
 
-  "_comment_LinkTypes": "The source 'this Issue blocks that work item' becomes Affects. NOT Parent/Child: a single Issue can block many items and a tree topology allows one parent, so hierarchy cannot express it.",
+  "_comment_LinkTypes": "The source 'this Issue blocks that work item' becomes Affects. NOT Parent/Child: a single Issue can block many items and a tree topology allows one parent, so hierarchy cannot express it. Successor/Predecessor carry the source's Dependencies and Dependants, which are the two ends of ONE relationship: ADO creates each link's reverse automatically, and within a run only the second item of a pair can resolve its partner, so the link is written exactly once.",
   "LinkTypes": {
     "Blocks": "Microsoft.VSTS.Common.Affects-Forward",
     "Parent": "System.LinkTypes.Hierarchy-Reverse",
-    "Related": "System.LinkTypes.Related"
+    "Related": "System.LinkTypes.Related",
+    "Successor": "System.LinkTypes.Dependency-Forward",
+    "Predecessor": "System.LinkTypes.Dependency-Reverse"
   },
 
-  "_comment_Tags": "Tags: an unmigrated parent, unmigrated blocked items, and a Defect's Source. Parent and blocks are kept as tags because they are worth querying. Documentation only: BuildTags names these itself, so editing them here changes nothing.",
+  "_comment_Tags": "Tags: an unmigrated parent, unmigrated blocked items, an unmigrated dependency, the source's own tag list (TaggedWith), and a Source value. Parent, blocks and depends are kept as tags because they are worth querying. Documentation only: BuildTags names these itself, so editing them here changes nothing.",
   "Tags": {
     "UnmigratedParent": "agility-parent",
     "UnmigratedBlocked": "agility-blocks",
     "Source": "agility-source"
   },
 
-  "_comment_ThemeAreaPaths": "EXAMPLES - replace with your org's Themes. A Story's/Defect's Theme supplies the area path leaf under the scope's area path (Theme name -> ADO node name, which may differ). A Theme with no entry, or an item with no Theme, falls back to the scope's own area path. List every Theme carrying a Story or Defect across all scopes (with -IncludeClosed). ADO rejects an unknown area path (TF401347), so run CreateAreaPaths after editing.",
+  "_comment_TeamAreaPaths": "OPTIONAL, EXAMPLES - replace with your org's teams. LAST RESORT for an area path, used only when an item would otherwise land at the PROJECT ROOT, i.e. when its scope has no area path of its own and it has no Theme. Order of evidence: scope, then Theme, then Team. The match is EXACT and must stay that way: team names often CONTAIN node names ('User Services - Sprint' contains 'User Services'), so a prefix or substring test would look correct and then mis-file the first team named after something that is not a node. Both the raw source team name and the cleaned name from TeamValueMap resolve, so an entry written from either system works. Derive entries from evidence - check where each team's work actually lives - and leave a team OUT when the data does not say; an unmapped team stays at the root, exactly as an unmapped Theme does. Run CreateAreaPaths after adding a target that is not already a scope's area path.",
+  "TeamAreaPaths": {
+    "Ops_Team": "Operations",
+    "Operations": "Operations",
+    "Support_Team - Sprint": "User Services",
+    "User Services - Sprint": "User Services"
+  },
+
+  "_comment_ThemeAreaPaths": "EXAMPLES - replace with your org's Themes. A Story's/Defect's Theme supplies the area path leaf under the scope's area path (Theme name -> ADO node name, which may differ). A Theme with no entry, or an item with no Theme, falls back to the scope's own area path (or to the Team, see TeamAreaPaths). List every Theme carrying a Story or Defect across all scopes. ADO rejects an unknown area path (TF401347), so run CreateAreaPaths after editing.",
   "ThemeAreaPaths": {
     "Applications": "Apps",
     "Databases": "Databases",
     "Networking": "Networking"
   },
 
-  "_comment_States": "Per source asset type, because ADO states differ per work item type. Impediment only has Open and Closed. ClosedState wins over Map for anything closed in the source, whatever its Status says.",
+  "_comment_StaleAfterDays": "OPTIONAL. Work that finished more than this many days before the run starts is created in its type's StaleState instead of its ClosedState, so long-finished work is archived rather than shown as Done. Age comes from the source ClosedDate, falling back to ChangeDate then CreateDate; an item with no date at all is never treated as stale. The cutoff is resolved ONCE per run so every item is measured against the same instant. Omit this key, or set it to zero or less, to turn the rule off. Note that ADO hides Removed items from backlogs, boards, and default queries.",
+  "StaleAfterDays": 365,
+
+  "_comment_States": "Per source asset type, because ADO states differ per work item type. Impediment only has Open and Closed. ClosedState wins over Map for anything closed in the source, whatever its Status says. StaleState is where work older than StaleAfterDays goes; a type WITHOUT one is never archived, which is why Issue has none - Impediment has no Removed state, and AssertStatesExist would fail the run up front if it were given one.",
   "States": {
     "Epic": {
       "DefaultState": "New",
       "ClosedState": "Done",
+      "StaleState": "Removed",
       "Map": {
         "Future": "New",
         "Ready": "New",
@@ -95,6 +111,7 @@
     "Story": {
       "DefaultState": "New",
       "ClosedState": "Done",
+      "StaleState": "Removed",
       "Map": {
         "Not Started": "New",
         "Ready": "Approved",
@@ -109,6 +126,7 @@
     "Defect": {
       "DefaultState": "New",
       "ClosedState": "Done",
+      "StaleState": "Removed",
       "Map": {
         "Not Started": "New",
         "Ready": "Approved",
@@ -131,6 +149,7 @@
     "Task": {
       "DefaultState": "To Do",
       "ClosedState": "Done",
+      "StaleState": "Removed",
       "Map": {
         "In Progress": "In Progress",
         "Completed": "Done",

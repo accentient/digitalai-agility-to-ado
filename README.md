@@ -30,18 +30,25 @@ Field, state, and value-map configuration lives in `mappings.json` and can be cu
 | Agility | Azure DevOps |
 |---|---|
 | `Name` | `System.Title` (truncated at 255; full text kept in the description) |
-| `Number` | `Custom.DigitalAIID` (drives idempotency) and a description footer |
+| `Number` | `Custom.DigitalAIID` (drives idempotency) and a Discussion comment on the migrated item |
 | `Description` | `System.Description` (HTML passed through) |
-| `Status` | `System.State` per type (closed-in-source lands closed); raw status kept in `Custom.DigitalAIStatus` |
+| `Status` | `System.State` per type (closed-in-source lands closed, and long-finished work lands `Removed` - see below); raw status kept in `Custom.DigitalAIStatus` |
 | `Super` | parent link (Related link when flattened) |
-| `Scope` + `Theme` | `System.AreaPath` (scope path + Theme leaf; Tasks inherit their parent's Theme) |
+| `Scope` + `Theme` (+ `Team`) | `System.AreaPath` (scope path + Theme leaf; Tasks inherit their parent's Theme; the Team places items that would otherwise land at the project root) |
 | `Timebox` | `System.IterationPath` |
 | `Owners` | `System.AssignedTo` (first *assignable* owner); the rest to `Custom.DigitalAIOwners` |
 | `CreatedBy`/`CreateDate`, `ChangedBy`/`ChangeDate` | backdated `System.CreatedBy/CreatedDate` and `ChangedBy/ChangedDate` (two-point history) |
 | `ClosedDate` | `Microsoft.VSTS.Common.ClosedDate`, written inside the closing transition |
 | `Order` | `Microsoft.VSTS.Common.BacklogPriority` |
-| `Category`, `Custom_FiscalYear`, `Team`, `Custom_Mandate`, `StrategicThemes`, `ResolutionReason` | `Custom.DigitalAI*` fields (see `mappings.json` `CustomFields`) |
-| unmigrated parent / blocked item / Defect source | `agility-parent:` / `agility-blocks:` / `agility-source:` tags |
+| `Category`, `Custom_FiscalYear`, `Team`, `Custom_Mandate`, `StrategicThemes`, `ResolutionReason` | `Custom.DigitalAI*` fields (see `mappings.json` `CustomFields`); the multi-value ones are joined with `; ` |
+| `ClosedBy` | `Microsoft.VSTS.Common.ClosedBy`, in a rule-checked patch, only when ADO accepts the identity |
+| `TaggedWith` | `System.Tags` |
+| `Dependencies` / `Dependants` | Successor / Predecessor links (`System.LinkTypes.Dependency-*`) |
+| `Links` | `Hyperlink` relations (non-URL locations go to the description) |
+| `Attachments` | files downloaded from the source and uploaded to ADO as `AttachedFile` relations |
+| an "Acceptance Criteria" heading inside `Description` | `Microsoft.VSTS.Common.AcceptanceCriteria` (cloned, not moved - see below) |
+| `Personas`, `Risk`, `Reference`, `RequestedBy` | the description's "Agility details" block (no ADO field exists for these) |
+| unmigrated parent / blocked item / dependency / source | `agility-parent:` / `agility-blocks:` / `agility-depends:` / `agility-source:` tags |
 
 `docs/design.md` has the full field audit and the reasoning behind these decisions.
 
@@ -52,6 +59,34 @@ Agility lets an Epic parent another Epic, to any depth. Azure DevOps does **not*
 ### Close dates and the revision history
 
 The Scrum process owns `Closed Date` (auto-stamped on entry to a closed state). To keep the *real* historical date, and to backdate the created/changed revisions, the tool uses `bypassRules` on the create and the state transition. The close date is written **inside** the closing transition, so it is present before the rule-checked assignee patch runs (Task's `Done` requires a non-empty close date). `System.AssignedTo` is never sent in a `bypassRules` payload - it is set by a separate rule-checked patch, so a departed identity is rejected rather than stored. This needs a PAT whose identity holds bypass rights.
+
+### Archiving long-finished work
+
+Set `StaleAfterDays` in `mappings.json` and work that finished longer ago than that is created in its type's `StaleState` (`Removed`) instead of its `ClosedState`, so a decade of finished work doesn't arrive looking like a live backlog. The rule is deliberately narrow:
+
+- It only ever applies to an item that would **otherwise land in its closed state**. Nothing active or in progress is touched, however old it is.
+- It only applies to a type that **has** a `StaleState`. Impediment has no `Removed` state, so `Issue` is given none - the exclusion is missing config, not a hard-coded type check, and `AssertStatesExist` fails the run up front if anyone adds one.
+- Age comes from `ClosedDate`, falling back to `ChangeDate` then `CreateDate`. An item with **no date at all is never archived**: no evidence of age is not the same as being old.
+- The cutoff is resolved **once per run**, so every item is measured against the same instant.
+- The real close date still rides along on the transition. `Removed` accepts `Closed Date` and does not require it (verified live on Epic, PBI, Bug and Task), so nothing is lost and no date is ever fabricated for it.
+
+Omit the key, or set it to zero or less, and the rule is off. **Azure DevOps hides `Removed` items from backlogs, boards, and default queries** - that is the point of archiving, but it is worth knowing before a run puts most of your items there. `-DryRun` prints `state=` per item and the summary counts how many would be removed, so check that number before writing.
+
+### Acceptance criteria are recovered from the description
+
+Agility has **no acceptance criteria attribute on any type** - people write them into the description under a heading. The tool finds that heading and **clones** the section into `Microsoft.VSTS.Common.AcceptanceCriteria`, leaving the text in the description as well, so nothing moves and nothing is lost.
+
+The section runs from the heading to the next heading (a real `<h1-6>`, a paragraph that is only short bold text, or a short plain paragraph ending in a colon - all three occur in real data), or to the end of the description. Orphaned closing tags and trailing spacer paragraphs are trimmed, and a heading with nothing under it writes no field at all.
+
+`Acceptance Criteria` is matched case-insensitively with an optional colon. `AC` is honoured **only in heading position** - preceded by a block tag and followed by a colon - because in the measured corpus every standalone `AC` in prose was something else entirely ("no MS or `AC` line"). Matching it loosely would be all false positives. The field only exists on Epic, Feature, Product Backlog Item and Bug, so Task and Impediment are skipped rather than having the write silently dropped.
+
+### Attachments
+
+Files are **copied**, not referenced: the source keeps them behind an authenticated endpoint, so each one is downloaded and re-uploaded into the ADO project's attachment store, then linked as an `AttachedFile` relation with a comment naming the source item.
+
+Copying is deliberately non-fatal. The work item already exists by then, so a file that won't move produces a warning and a count rather than losing the item, and each file is handled independently. Anything over 60 MB (ADO's default cap) is skipped with a warning. A `-DryRun` downloads nothing and just reports `attachments=N` per item; the run summary reports files copied and failed separately from item counts.
+
+The binary path is worth one note for anyone modifying it: PowerShell enumerates a collection on output, so a `byte[]` returned through a pipeline silently becomes an `Object[]` of boxed bytes with an identical `.Length`, and uploading that corrupts the file. `InvokeAgilityDownload` guards against this and a test asserts the returned value really is a `byte[]`.
 
 ### Owners and identities
 
@@ -112,9 +147,9 @@ The script takes no parameters. Edit the calls in `Main` (the control panel) and
 ```powershell
 # CreateAreaPaths -DryRun            # list the area nodes the scopes/Themes need
 # CreateAreaPaths                    # create them (run before migrating Stories/Defects/Tasks)
-# Migrate -DryRun -IncludeClosed     # preview everything, writes nothing
-# Migrate -IncludeClosed             # the real migration, all types, all scopes
-# Migrate -IncludeClosed -Types Task # one type
+# Migrate -DryRun                    # preview everything, writes nothing
+# Migrate                            # the real migration, all types, all scopes
+# Migrate -Types Task                # one type
 # MaterializeOwners -DryRun          # optional: preview adding owners to the org as Stakeholders
 # DeleteAllTasks -DryRun             # count Tasks (a delete helper for re-running just Tasks)
 ```
@@ -122,17 +157,20 @@ The script takes no parameters. Edit the calls in `Main` (the control panel) and
 | Switch | Effect |
 |---|---|
 | `-DryRun` | Print what would happen. Writes nothing to Azure DevOps. |
-| `-IncludeClosed` | Include closed items (excluded by default). Never includes "Dead" placeholder templates. |
 | `-Scope` | Narrow to one configured scope. Cross-scope parents will not resolve. |
 | `-Types` | Which Agility types to migrate. Defaults to all five. Order is always Epic → Story → Defect → Task → Issue regardless of what you pass, so children find their parents. |
 
 **`Migrate` without `-DryRun` writes to Azure DevOps.** Preview first.
 
+**Closed items always migrate.** There is no switch for it: every real run wanted them, so the option was removed rather than left as a trap. Items whose source `AssetState` is *Dead* are the one exclusion - those are placeholder templates and are never created.
+
 Before the first create, the tool checks every mapped state and field against what ADO reports for each type, so a mapping mistake fails on call one, not on item one of tens of thousands. It's idempotent and resumable: items are matched by `Custom.DigitalAIID` and skipped, so an interrupted run just continues.
 
 ### Area paths
 
-Each scope maps to an ADO area path; Stories/Defects add a Theme leaf below it. **The nodes must exist** or ADO rejects the item (`TF401347`). `CreateAreaPaths` builds exactly the nodes your data needs (derived live, closed items included) - run it after adding a scope or a `ThemeAreaPaths` entry, before the migration that needs them.
+Each scope maps to an ADO area path; Stories/Defects add a Theme leaf below it. **The nodes must exist** or ADO rejects the item (`TF401347`). `CreateAreaPaths` builds exactly the nodes your data needs (derived live, closed items included) - run it after adding a scope, a `ThemeAreaPaths` entry, or a `TeamAreaPaths` target, before the migration that needs them.
+
+Resolution order is **scope, then Theme, then Team**. The Team is a last resort: it is consulted only when an item would otherwise land at the bare project root, which happens when its scope has no area path of its own and it carries no Theme. `TeamAreaPaths` is matched **exactly**, never by prefix or substring - team names frequently contain node names (a team called `User Services - Sprint` contains the node name `User Services`), so a text match looks right and then mis-files the first team named after something that is not a node. Derive the entries from where each team's work actually lives, and leave a team out when the data doesn't say; an unmapped team stays at the root, exactly like an unmapped Theme.
 
 ## Validate before you migrate
 
