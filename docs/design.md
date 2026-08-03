@@ -280,12 +280,19 @@ The 18 Dead Epics are placeholder templates, not deleted work: "IT - Registratio
 `<insert semester>`", "Data Warehouse `< Insert Business Unit >`", "BLDG Classroom XXXX - update".
 They must never migrate.
 
-The default filter `AssetState!='Closed'` happens to exclude them, because it returns only state 64.
-But `-IncludeClosed` originally dropped the where clause entirely, which would have migrated all 18.
-`-IncludeClosed` therefore filters `AssetState!='Dead'` rather than passing no filter: that returns
-Active plus Closed and never the templates.
+This started as two halves of one conditional: an `AssetState!='Closed'` filter by default, which
+happens to exclude the templates because it returns only state 64, and an `AssetState!='Dead'` filter
+when closed items were requested. An early version dropped the where clause entirely for the latter,
+which would have migrated all 18.
 
-There is no code path that queries Epics with no `AssetState` filter, and a test asserts it.
+Closed items are now migrated unconditionally - every real run wanted them, so the switch that gated
+it was removed rather than left as a trap. The Dead filter is what survives that removal, and it is
+the load-bearing half: the where clause is always `Scope=...;AssetState!='Dead'`, which returns Active
+plus Closed and never the templates.
+
+There is no code path that queries with no `AssetState` filter. Tests assert that no closed filter
+remains, that every scoped query carries exactly one Dead filter, and that no reference to the removed
+switch survives.
 
 ### State comes from AssetState, not Status
 
@@ -449,9 +456,9 @@ different payloads, the dry run would be validating something other than what ge
 Relations are omitted from validation, because a dry run has no real parent id to point at. So the
 dry run proves the fields, not the links.
 
-Validation costs one HTTP call per item, so a dry run runs at roughly the speed of a real one. For
-the 104 open Epics that is around a minute; with `-IncludeClosed` (858 Epics) it takes several
-minutes. That is the price of knowing the payloads are good before writing.
+Validation costs one HTTP call per item, so a dry run runs at roughly the speed of a real one. Across
+all 877 Epics that is several minutes. That is the price of knowing the payloads are good before
+writing.
 
 ## Testing
 
