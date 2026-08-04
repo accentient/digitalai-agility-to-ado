@@ -624,6 +624,167 @@ Describe "AssertStatesExist proves the stale state too" {
   }
 }
 
+##################################################################################################
+# AssertFieldsExist must cover the Fields block too (added 2026-08-04).
+#
+# It checked RequiredFields and CustomFields but NOT Fields - Effort, Remaining Work, Resolution,
+# Closed Date, Closed By, Environment, Found In, Business Value, the planned dates. Those are exactly
+# the fields ADO accepts a write to and then silently discards, so a process edit could have gutted
+# any of them across 53,000 items with a clean run and a green summary.
+#
+# FieldAdoTypes says which types each one is written to; a Fields key with no entry is checked
+# everywhere, which errs toward catching rather than missing.
+##################################################################################################
+Describe "AssertFieldsExist covers the Fields block" {
+
+  BeforeAll {
+    $script:config = [pscustomobject]@{
+      AzureDevOps = [pscustomobject]@{ OrganizationUrl = "https://dev.azure.com/org"; Project = "Migration" }
+    }
+    # Only what these tests need; the real file has the full set.
+    $script:mappings = [pscustomobject]@{
+      WorkItemTypes  = [pscustomobject]@{ Story = "Product Backlog Item"; Task = "Task" }
+      RequiredFields = [pscustomobject]@{ AgilityId = "Custom.DigitalAIID" }
+      CustomFields   = [pscustomobject]@{}
+      Fields         = [pscustomobject]@{
+        Estimate     = "Microsoft.VSTS.Scheduling.Effort"
+        TaskEstimate = "Microsoft.VSTS.Scheduling.RemainingWork"
+        ClosedDate   = "Microsoft.VSTS.Common.ClosedDate"
+      }
+      FieldAdoTypes  = [pscustomobject]@{
+        Estimate     = @("Product Backlog Item")
+        TaskEstimate = @("Task")
+      }
+      States         = [pscustomobject]@{
+        Story = [pscustomobject]@{ DefaultState = "New"; ClosedState = "Done"; Map = [pscustomobject]@{} }
+        Task  = [pscustomobject]@{ DefaultState = "To Do"; ClosedState = "Done"; Map = [pscustomobject]@{} }
+      }
+    }
+
+  }
+
+  # The Mock is declared inside each It on purpose: registered from a helper function it applies to
+  # that function's scope, not the test's, and silently fails to intercept.
+  It "fails when a Fields entry is missing from a type that gets it" {
+    $script:fieldList = @('Custom.DigitalAIID', 'Microsoft.VSTS.Common.ClosedDate')
+    Mock InvokeAdoRequest { [pscustomobject]@{ value = @($script:fieldList | ForEach-Object { [pscustomobject]@{ referenceName = $_ } }) } }
+
+    { AssertFieldsExist @('Story') } | Should -Throw -ExpectedMessage "*Microsoft.VSTS.Scheduling.Effort*"
+  }
+
+  It "passes when every field the type gets is present" {
+    $script:fieldList = @('Custom.DigitalAIID', 'Microsoft.VSTS.Common.ClosedDate', 'Microsoft.VSTS.Scheduling.Effort')
+    Mock InvokeAdoRequest { [pscustomobject]@{ value = @($script:fieldList | ForEach-Object { [pscustomobject]@{ referenceName = $_ } }) } }
+
+    { AssertFieldsExist @('Story') } | Should -Not -Throw
+  }
+
+  # Effort is deliberately NOT written to Task (Scrum's Task has no such field), so its absence there
+  # must not fail the run - that would block a perfectly correct migration.
+  It "does not demand a field on a type the code never writes it to" {
+    $script:fieldList = @('Custom.DigitalAIID', 'Microsoft.VSTS.Common.ClosedDate', 'Microsoft.VSTS.Scheduling.RemainingWork')
+    Mock InvokeAdoRequest { [pscustomobject]@{ value = @($script:fieldList | ForEach-Object { [pscustomobject]@{ referenceName = $_ } }) } }
+
+    { AssertFieldsExist @('Task') } | Should -Not -Throw
+  }
+
+  # ClosedDate has no FieldAdoTypes entry, so it is checked on every type: missing means missing.
+  It "checks an unscoped Fields entry against every type" {
+    $script:fieldList = @('Custom.DigitalAIID', 'Microsoft.VSTS.Scheduling.RemainingWork')
+    Mock InvokeAdoRequest { [pscustomobject]@{ value = @($script:fieldList | ForEach-Object { [pscustomobject]@{ referenceName = $_ } }) } }
+
+    { AssertFieldsExist @('Task') } | Should -Throw -ExpectedMessage "*ClosedDate*"
+  }
+}
+
+##################################################################################################
+# InvokeWithRetry (hardened 2026-08-04). A 13 hour run makes each of these matter.
+##################################################################################################
+Describe "InvokeWithRetry" {
+
+  BeforeAll {
+    # Shaped like the error record a failed Invoke-RestMethod produces, so the decision functions can
+    # be tested directly. Constructing genuine HTTP exceptions is fragile and tests the framework
+    # rather than our logic.
+    function FakeError([object]$status = $null, [string]$body = '', [object]$retryAfter = $null)
+    {
+      $response = $null
+      if ($null -ne $status)
+      {
+        $headers = @{}
+        if ($null -ne $retryAfter) { $headers['Retry-After'] = $retryAfter }
+        $response = [pscustomobject]@{
+          StatusCode = [pscustomobject]@{ value__ = $status }
+          Headers    = $headers
+        }
+      }
+      return [pscustomobject]@{
+        Exception    = [pscustomobject]@{ Response = $response; Message = $body }
+        ErrorDetails = [pscustomobject]@{ Message = $body }
+      }
+    }
+  }
+
+  BeforeEach { $script:tries = 0 }
+
+  # The one that mattered most: a socket timeout or connection reset has NO Response at all, so the
+  # old status check read $null, decided "not transient", and gave up without a single retry - on a
+  # 13 hour run that is the difference between resuming and starting again.
+  It "treats a transport failure with no HTTP response as transient" {
+    IsTransientFailure (FakeError) | Should -BeTrue
+  }
+
+  It "still treats 429 and 5xx as transient" {
+    foreach ($code in @(429, 500, 502, 503)) { IsTransientFailure (FakeError $code) | Should -BeTrue -Because "HTTP $code" }
+  }
+
+  It "does not retry a 4xx that will never succeed" {
+    foreach ($code in @(400, 401, 403, 404)) { IsTransientFailure (FakeError $code) | Should -BeFalse -Because "HTTP $code" }
+  }
+
+  # ADO returns the circular-link rejection as HTTP 500, which looks transient and is not: the link
+  # is refused every time. Retrying wasted ~6 seconds per cyclic link.
+  It "does not retry a circular link rejection, despite its 500 status" {
+    IsTransientFailure (FakeError 500 'TF201035: would result in a circular relationship') | Should -BeFalse
+  }
+
+  # ADO tells us how long to wait on a 429. Guessing shorter just gets throttled again.
+  It "honours Retry-After over its own backoff" {
+    ResolveRetryDelay (FakeError 429 'too many' 37) 1 | Should -Be 37
+  }
+
+  It "reads a Retry-After sent as a single-element array, as headers often are" {
+    ResolveRetryDelay (FakeError 429 'too many' @(12)) 1 | Should -Be 12
+  }
+
+  It "falls back to exponential backoff when there is no Retry-After" {
+    ResolveRetryDelay (FakeError 503) 1 | Should -Be 2
+    ResolveRetryDelay (FakeError 503) 2 | Should -Be 4
+  }
+
+  # A server can send an absurd Retry-After; a migration must not sleep for an hour on one call.
+  It "caps an unreasonable Retry-After" {
+    ResolveRetryDelay (FakeError 429 'slow down' 9999) 1 | Should -BeLessOrEqual 120
+  }
+
+  It "ignores a non-numeric Retry-After rather than throwing" {
+    ResolveRetryDelay (FakeError 429 'slow down' 'Wed, 21 Oct 2026 07:28:00 GMT') 1 | Should -Be 2
+  }
+
+  # The loop itself: a plain throw carries no Response, so it is transient and must be retried.
+  It "retries a transient failure and returns the eventual result" {
+    $result = InvokeWithRetry { $script:tries++; if ($script:tries -lt 3) { throw "connection reset" }; return "ok" } 3 0
+
+    $result | Should -Be "ok"
+    $script:tries | Should -Be 3
+  }
+
+  It "gives up after the last attempt and rethrows" {
+    { InvokeWithRetry { $script:tries++; throw "connection reset" } 3 0 } | Should -Throw
+    $script:tries | Should -Be 3
+  }
+}
+
 Describe "ResolveAreaPath" {
 
   BeforeAll {
@@ -3765,6 +3926,142 @@ Describe "Dependency links are added after the create, never inside it" {
     AddAdoDependencyLinks 42 ([pscustomobject]@{ Number = 'S-1' }) (Deps @(101) @())
 
     @($script:patches).Count | Should -Be 0
+  }
+}
+
+##################################################################################################
+# A dependency partner that THIS RUN will create is not "not in Azure DevOps" (fixed 2026-08-04).
+#
+# Both ends of a dependency are read, and only the second item of a pair finds its partner already
+# in the map - so the first one warned and tagged agility-depends, and the link was then written
+# from the other side anyway. On the full run that produced 2,216 items carrying a tag claiming a
+# missing link that was in fact present (verified: 60 of 60 sampled had the link).
+#
+# $script:numbersInRun holds every Agility number the run has read, so a partner that is merely not
+# created YET is distinguished from one genuinely outside the configured scopes.
+##################################################################################################
+Describe "Dependency partners inside the same run are not reported missing" {
+
+  BeforeAll {
+    $script:DryRunPendingId = 'would-be-created-by-this-run'
+    function DepItem($deps) { return [pscustomobject]@{ DependencyNumbers = $deps; DependantNumbers = @() } }
+  }
+
+  BeforeEach { $script:DryRun = $false; $script:numbersInRun = @{} }
+
+  It "does not report a partner this run will create later" {
+    $script:numbersInRun = @{ 'S-2' = $true }
+
+    $r = ResolveDependencyIds (DepItem @('S-2')) @{}
+
+    $r.Unresolved | Should -BeNullOrEmpty -Because "S-2 is in this run; the link is written from its side"
+    $r.Successors | Should -BeNullOrEmpty
+  }
+
+  # The tag still has to appear for a partner that is genuinely outside the configured scopes,
+  # because then nothing will ever create the link and the number is the only record.
+  It "still reports a partner that is genuinely outside the run" {
+    $script:numbersInRun = @{ 'S-2' = $true }
+
+    (ResolveDependencyIds (DepItem @('S-9999')) @{}).Unresolved | Should -Be @('S-9999')
+  }
+
+  It "still links a partner that already exists" {
+    $script:numbersInRun = @{ 'S-2' = $true }
+
+    (ResolveDependencyIds (DepItem @('S-2')) @{ 'S-2' = 101 }).Successors | Should -Be @(101)
+  }
+
+  # With no run set populated the old behaviour must hold, so every other caller and older test is
+  # unaffected.
+  It "reports everything unresolved when no run set has been built" {
+    $script:numbersInRun = @{}
+
+    (ResolveDependencyIds (DepItem @('S-2')) @{}).Unresolved | Should -Be @('S-2')
+  }
+
+  It "records every number it reads, so both ends of a pair are known" {
+    $script:numbersInRun = @{}
+
+    RecordNumbersInRun @([pscustomobject]@{ Number = 'S-1' }, [pscustomobject]@{ Number = 'S-2' })
+
+    $script:numbersInRun.ContainsKey('S-1') | Should -BeTrue
+    $script:numbersInRun.ContainsKey('S-2') | Should -BeTrue
+  }
+}
+
+##################################################################################################
+# Cleaning up the agility-depends tags an earlier run left behind.
+#
+# It removes a tag ONLY when the item it names is provably in Azure DevOps, so a tag recording a
+# genuinely unmigrated partner survives. That is what makes it safe to run against a whole project.
+##################################################################################################
+Describe "StripStaleDependencyTag" {
+
+  It "removes a depends tag whose target IS in Azure DevOps" {
+    StripStaleDependencyTag 'agility-depends:S-2' @{ 'S-2' = 101 } | Should -Be ''
+  }
+
+  It "keeps a depends tag whose target is genuinely not migrated" {
+    StripStaleDependencyTag 'agility-depends:S-9999' @{ 'S-2' = 101 } | Should -Be 'agility-depends:S-9999'
+  }
+
+  It "keeps every other kind of tag untouched" {
+    foreach ($tag in @('agility-parent:E-1', 'agility-blocks:S-3', 'agility-source:Alumni', 'AV', 'Classroom'))
+    {
+      StripStaleDependencyTag $tag @{ 'E-1' = 1; 'S-3' = 2 } | Should -Be $tag -Because "$tag is not a dependency tag"
+    }
+  }
+
+  It "rebuilds a tag string keeping the good tags and dropping only the stale ones" {
+    $tags = 'AV; agility-depends:S-2; agility-parent:E-1; agility-depends:S-9999; agility-source:Alumni'
+
+    RemoveStaleDependencyTags $tags @{ 'S-2' = 101 } |
+      Should -Be 'AV; agility-parent:E-1; agility-depends:S-9999; agility-source:Alumni'
+  }
+
+  It "returns the tags unchanged when nothing is stale" {
+    $tags = 'AV; agility-parent:E-1'
+
+    RemoveStaleDependencyTags $tags @{ 'S-2' = 101 } | Should -Be $tags
+  }
+
+  It "handles an item with no tags at all" {
+    RemoveStaleDependencyTags '' @{} | Should -Be ''
+    RemoveStaleDependencyTags $null @{} | Should -Be ''
+  }
+
+  # Every tag on the item could be stale, which must leave an empty string rather than stray separators.
+  It "leaves nothing behind when every tag was stale" {
+    RemoveStaleDependencyTags 'agility-depends:S-2; agility-depends:S-3' @{ 'S-2' = 1; 'S-3' = 2 } |
+      Should -Be ''
+  }
+
+  ##################################################################################################
+  # Removing a tag needs op=REPLACE. This cost a wasted 53,705-item pass to learn.
+  #
+  # ADO MERGES tags on op=add: it treats the value as tags to add, not as the new complete list. So
+  # patching a SHORTER list with op=add changes nothing, returns HTTP 200, and reports success - the
+  # first repair run "repaired" 2,215 items and removed not one tag. Proven live on #155317: op=add
+  # merged and duplicated the tags, op=replace set them exactly.
+  ##################################################################################################
+  It "uses op=replace, because op=add MERGES tags and can never remove one" {
+    $op = BuildTagReplaceOp 'AV; agility-source:Alumni'
+
+    $op.op    | Should -Be 'replace' -Because "op=add merges and would silently no-op"
+    $op.path  | Should -Be '/fields/System.Tags'
+    $op.value | Should -Be 'AV; agility-source:Alumni'
+  }
+
+  It "still uses replace when clearing the last tag" {
+    (BuildTagReplaceOp '').op | Should -Be 'replace'
+  }
+
+  It "never patches tags with add anywhere in the repair" {
+    $source = Get-Content $script:scriptPath -Raw
+    $body = [regex]::Match($source, "function RepairDependencyTags\b[\s\S]*?(?=\r?\nfunction )").Value
+
+    $body | Should -Not -Match "op\s*=\s*[`"']add[`"'][^\n]*System\.Tags"
   }
 }
 

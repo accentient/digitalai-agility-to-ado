@@ -64,6 +64,8 @@ function Main
   # MaterializeOwners -DryRun -Types Epic                 # list owners that would be added to the org
   # MaterializeOwners -Types Epic                         # add them as free Stakeholders (needs admin PAT)
   # MaterializeOwners                                     # all types' owners, before the full migration
+  # RepairDependencyTags -DryRun                          # count stale agility-depends tags from an old run
+  # RepairDependencyTags                                  # remove them (only where the partner IS in ADO)
   #
   # Deletes are PERMANENT (destroy=true, no recycle bin) and take one type at a time. Always -DryRun
   # first. Deleting a type ORPHANS whatever hangs off it - Features hang off Epics, PBIs and Bugs off
@@ -176,6 +178,10 @@ function Migrate([switch]$DryRun, [string]$Scope, [string[]]$Types = @('Epic','S
   # Bridges Agility oids to Numbers, because links are expressed in oids but the tag map is keyed
   # by Number. Accumulates across types so a Story can resolve its Epic.
   $script:numberByOid = @{}
+
+  # Every Agility number this run reads, so a dependency partner that is merely not created YET is
+  # not mistaken for one outside the configured scopes.
+  $script:numbersInRun = @{}
 
   # Dependency order, not the caller's order. Epics first so Stories and Defects can parent to
   # them; Tasks after both, since a Task parents to a Story or a Defect; Issues last, because the
@@ -712,6 +718,10 @@ function MigrateEpics($scopes, $existing)
 
   $epics = ResolveEpicHierarchy $assets $script:mappings
   foreach ($epic in $epics) { $script:numberByOid[$epic.Oid] = $epic.Number }
+
+  # Before any of them migrate, so the first item of a dependency pair already knows its partner is
+  # coming and does not report the link as missing.
+  RecordNumbersInRun $epics
   WriteLog
 
   # Epics before Features, so a Feature always has its parent id available when it is created.
@@ -761,6 +771,10 @@ function MigrateWorkitems([string]$agilityType, $scopes, $existing)
     $script:numberByOid[$item.Oid] = $item.Number
     if ($item.SuperOid -and $item.ParentNumber) { $script:numberByOid[$item.SuperOid] = $item.ParentNumber }
   }
+
+  # Same reason as the Epic path: both ends of a dependency are read, so a partner still to be
+  # created must not be reported as absent from Azure DevOps.
+  RecordNumbersInRun $items
 
   foreach ($item in $items)
   {
@@ -1707,8 +1721,22 @@ function ResolveBlockedIds($item, $existing)
 #
 # An unresolved number is an Epic outside the configured scopes, and keeps its number as a tag the
 # same way an unmigrated parent does.
+# Every Agility number this run has read, so ResolveDependencyIds can tell "will exist shortly" from
+# "outside the configured scopes". Filled as each type's assets are read, before any of them migrate.
+function RecordNumbersInRun($items)
+{
+  if ($null -eq $script:numbersInRun) { $script:numbersInRun = @{} }
+
+  foreach ($item in @($items))
+  {
+    if ($item.Number) { $script:numbersInRun["$($item.Number)"] = $true }
+  }
+}
+
 function ResolveDependencyIds($item, $existing)
 {
+  if ($null -eq $script:numbersInRun) { $script:numbersInRun = @{} }
+
   $successors = @()
   $predecessors = @()
   $unresolved = @()
@@ -1721,7 +1749,15 @@ function ResolveDependencyIds($item, $existing)
     {
       if (-not $number) { continue }
 
-      if (-not $existing.ContainsKey($number)) { $unresolved += $number; continue }
+      if (-not $existing.ContainsKey($number))
+      {
+        # Not in ADO YET is not the same as not in ADO. Both ends of a dependency are read, so a
+        # partner this run will create writes the link from ITS side once it exists. Reporting it
+        # here put an agility-depends tag on 2,216 items claiming a link was missing when it was
+        # not. Only a partner outside the run - a scope that is not configured - is truly lost.
+        if (-not $script:numbersInRun.ContainsKey($number)) { $unresolved += $number }
+        continue
+      }
 
       # A dry run creates nothing, so an id it only pencilled in is not a real link target. It is
       # not a miss either: a real run would have made it, so it is neither reported nor written.
@@ -2861,6 +2897,141 @@ function AddAdoMigrationComment([int]$id, $epic)
 }
 
 ##################################################################################################
+# Cleaning up agility-depends tags left by an earlier run
+#
+# Before 2026-08-04 a dependency whose partner had not been created YET was reported as "not in
+# Azure DevOps" and tagged, even though the link was then written from the partner's side. That put
+# an inaccurate tag on 2,216 items. The migration no longer does it; this repairs what it left.
+#
+# A tag is removed ONLY when the item it names is provably in Azure DevOps, so a tag recording a
+# genuinely unmigrated partner - one in a scope that is not configured - survives untouched.
+##################################################################################################
+
+# One tag: returns it unchanged, or '' when it is a dependency tag whose target exists.
+function StripStaleDependencyTag([string]$tag, $existing)
+{
+  $trimmed = "$tag".Trim()
+  if ($trimmed -notlike 'agility-depends:*') { return $trimmed }
+
+  $number = $trimmed.Substring('agility-depends:'.Length)
+  if ($existing.ContainsKey($number)) { return '' }
+
+  return $trimmed
+}
+
+# The op that SETS an item's tags to exactly this string.
+#
+# op=REPLACE, and that is the whole point. ADO MERGES on op=add: it reads the value as tags to add
+# rather than as the new complete list, so patching a SHORTER list with add changes nothing, returns
+# HTTP 200 and reports success. The first repair pass did exactly that - 2,215 items "repaired", not
+# one tag removed. Proven live on #155317: add merged and duplicated them, replace set them exactly.
+function BuildTagReplaceOp([string]$tags)
+{
+  return @{ op = "replace"; path = "/fields/System.Tags"; value = $tags }
+}
+
+# The whole tag string with the stale dependency tags removed.
+function RemoveStaleDependencyTags([string]$tags, $existing)
+{
+  if (-not $tags) { return '' }
+
+  $kept = @()
+  foreach ($tag in ($tags -split ';'))
+  {
+    $result = StripStaleDependencyTag $tag $existing
+    if ($result) { $kept += $result }
+  }
+
+  return ($kept -join '; ')
+}
+
+# Walks the project and repairs every item carrying a stale agility-depends tag.
+#
+# The tags cannot be found with WIQL: System.Tags matches a whole tag at a time and has no prefix
+# form, so a CONTAINS on 'agility-depends' returns zero rows rather than an error - the same trap
+# that once made GetMigratedIdMap return an empty map. So the tags are read and matched on the
+# client, exactly as that function does.
+function RepairDependencyTags([switch]$DryRun)
+{
+  $script:DryRun = [bool]$DryRun
+  $repaired = 0
+  $failed = 0
+  $skipped = 0
+
+  StartLog
+  $script:runStarted = Get-Date
+  WriteLogDetail "RepairDependencyTags log, started $($script:runStarted.ToString('yyyy-MM-dd HH:mm:ss'))"
+  WriteLogDetail ""
+
+  $script:config = GetConfig $script:configPath
+  $script:mappings = GetConfig $script:mappingsPath
+
+  WriteLog "Removing stale agility-depends tags in $($script:config.AzureDevOps.OrganizationUrl) project $($script:config.AzureDevOps.Project)"
+  WriteLog "A tag is removed only when the item it names IS in Azure DevOps, so a genuinely unmigrated partner keeps its tag."
+  if ($script:DryRun) { WriteLog "DRY RUN - nothing will be written" Yellow }
+  WriteLog
+
+  WriteLog "Resolving credentials..."
+  $script:adoHeaders = BuildAdoHeaders
+  WriteLog
+
+  $existing = GetMigratedIdMap
+  WriteLog "Found $($existing.Count) migrated items"
+  WriteLog
+
+  $org = $script:config.AzureDevOps.OrganizationUrl.TrimEnd('/')
+  $ids = @()
+  foreach ($t in $script:DeletableAdoTypes) { $ids += GetAllIdsOfType $t }
+  WriteLog "Scanning $($ids.Count) work items for stale tags"
+  WriteLog
+
+  for ($i = 0; $i -lt $ids.Count; $i += 200)
+  {
+    $batch = $ids[$i..([Math]::Min($i + 199, $ids.Count - 1))]
+    $url = "{0}/_apis/wit/workitems?ids={1}&fields=System.Id,System.Tags&api-version=7.1" -f $org, ($batch -join ',')
+
+    foreach ($item in (InvokeAdoRequest $url "Get" $null $null).value)
+    {
+      $tags = "$($item.fields.'System.Tags')"
+      if ($tags -notmatch 'agility-depends') { continue }
+
+      $cleaned = RemoveStaleDependencyTags $tags $existing
+      if ($cleaned -eq $tags) { $skipped++; continue }
+
+      if ($script:DryRun) { $repaired++; continue }
+
+      try
+      {
+        InvokeAdoRequest ("{0}/_apis/wit/workitems/{1}?api-version=7.1" -f $org, $item.id) "Patch" `
+          @(BuildTagReplaceOp $cleaned) "application/json-patch+json" | Out-Null
+        $repaired++
+      }
+      catch
+      {
+        WriteLog "  FAIL    #$($item.id) tags could not be updated - $(ReadAdoError $_)" Red
+        WriteErrorDetail $_ "repair tags on #$($item.id)"
+        $failed++
+      }
+    }
+
+    if ((($i / 200) % 10) -eq 0 -and $i -gt 0) { WriteLog "  scanned $i / $($ids.Count)..." }
+  }
+
+  WriteLog
+  WriteLog "----------------------------------------"
+  WriteLog "$(if ($script:DryRun) { 'Would repair:' } else { 'Repaired:' })  $repaired"
+  WriteLog "Left alone (partner genuinely not migrated): $skipped"
+  WriteLog "Failed:   $failed"
+  WriteLog "----------------------------------------"
+  if ($script:logPath)
+  {
+    $elapsed = (Get-Date) - $script:runStarted
+    WriteLog "Log: $script:logPath" Cyan
+    WriteLogDetail "Finished $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')) after $([int]$elapsed.TotalMinutes)m $($elapsed.Seconds)s"
+  }
+}
+
+##################################################################################################
 # Attachments
 #
 # Agility keeps the file itself behind attachment.img/{numericId}; the work item only holds oids. So
@@ -3456,6 +3627,30 @@ function AssertFieldsExist($agilityTypes)
         }
       }
     }
+
+    # The Fields block, which went unchecked until 2026-08-04. These are the stock Microsoft.VSTS.*
+    # fields - Effort, Remaining Work, Resolution, Closed Date, Closed By, Environment, Found In,
+    # Business Value, the planned dates - and they are precisely the ones ADO accepts a write to and
+    # then silently discards. Unchecked, a process edit could have gutted any of them across 53,000
+    # items and still produced a clean run and a green summary.
+    #
+    # FieldAdoTypes scopes each one to the types the code actually writes it to (Effort everywhere
+    # except Task, Remaining Work only on Task, Resolution only on Impediment). A key with no entry
+    # is checked on EVERY type, which errs toward catching a problem rather than missing one.
+    if ($script:mappings.Fields)
+    {
+      foreach ($fp in $script:mappings.Fields.PSObject.Properties)
+      {
+        $scope = if ($script:mappings.FieldAdoTypes -and $script:mappings.FieldAdoTypes.PSObject.Properties[$fp.Name])
+                 { @($script:mappings.FieldAdoTypes.PSObject.Properties[$fp.Name].Value) }
+                 else { $adoTypes }
+
+        if (($scope -contains $t) -and ($actual -notcontains $fp.Value))
+        {
+          $problems += "$t is missing $($fp.Value)"
+        }
+      }
+    }
   }
 
   if ($problems)
@@ -3607,9 +3802,60 @@ function MapPriority([string]$agilityPriority)
 # Plumbing
 ##################################################################################################
 
-# Retries 429 and 5xx with exponential backoff. Anything else fails immediately, because retrying
-# a 401 or a 400 just wastes time.
-function InvokeWithRetry([scriptblock]$action, [int]$attempts = 3)
+# Longest this will ever sleep on one attempt. A server can send an absurd Retry-After and a
+# migration must not stall for an hour on a single call.
+$script:MaxRetryDelaySeconds = 120
+
+# Is this failure worth trying again?
+#
+# **A failure with NO response is the important case.** A socket timeout, a dropped connection or a
+# DNS blip produces an error record with no Response at all, so reading `.StatusCode` gave $null,
+# which compared false against every status and made the old code give up WITHOUT A SINGLE RETRY.
+# On a 13 hour run that is the difference between resuming and starting over, and it is exactly the
+# kind of failure a long run actually hits.
+#
+# The one 5xx that is NOT transient: ADO returns the circular-link rejection as HTTP 500, and that
+# link will be refused every time. Retrying it wasted ~6 seconds per cyclic link.
+function IsTransientFailure($errorRecord)
+{
+  if (IsCircularLinkProblem (ReadAdoError $errorRecord)) { return $false }
+
+  $response = $errorRecord.Exception.Response
+  if (-not $response) { return $true }
+
+  $status = $response.StatusCode.value__
+  if ($null -eq $status) { return $true }
+
+  return (($status -eq 429) -or ($status -ge 500 -and $status -le 599))
+}
+
+# How long to wait before the next attempt. ADO sends Retry-After on a 429 saying exactly how long it
+# wants; guessing shorter just earns another 429. Falls back to exponential backoff when there is no
+# usable header, and never exceeds MaxRetryDelaySeconds.
+function ResolveRetryDelay($errorRecord, [int]$attempt)
+{
+  $backoff = [int][Math]::Pow(2, $attempt)
+
+  $header = $errorRecord.Exception.Response.Headers['Retry-After']
+  # Headers commonly arrive as a single element collection rather than a bare value.
+  if ($header -is [array]) { $header = @($header)[0] }
+
+  if ($null -ne $header)
+  {
+    $seconds = 0
+    # Retry-After may also be an HTTP date, which we do not attempt to parse; the backoff covers it.
+    if ([int]::TryParse("$header", [ref]$seconds) -and $seconds -gt 0)
+    {
+      return [Math]::Min($seconds, $script:MaxRetryDelaySeconds)
+    }
+  }
+
+  return [Math]::Min($backoff, $script:MaxRetryDelaySeconds)
+}
+
+# Retries transient failures with backoff. Anything permanent fails immediately, because retrying a
+# 400 or a 401 just wastes time. $fixedDelay is for tests only: 0 makes the retries instant.
+function InvokeWithRetry([scriptblock]$action, [int]$attempts = 3, [int]$fixedDelay = -1)
 {
   for ($attempt = 1; $attempt -le $attempts; $attempt++)
   {
@@ -3619,14 +3865,13 @@ function InvokeWithRetry([scriptblock]$action, [int]$attempts = 3)
     }
     catch
     {
+      if (-not (IsTransientFailure $_) -or $attempt -eq $attempts) { throw }
+
+      $delay = if ($fixedDelay -ge 0) { $fixedDelay } else { ResolveRetryDelay $_ $attempt }
       $status = $_.Exception.Response.StatusCode.value__
-
-      $isTransient = ($status -eq 429) -or ($status -ge 500 -and $status -le 599)
-      if (-not $isTransient -or $attempt -eq $attempts) { throw }
-
-      $delay = [Math]::Pow(2, $attempt)
-      WriteLog "  RETRY   HTTP $status, attempt $attempt of $attempts, waiting $delay seconds" DarkYellow
-      Start-Sleep -Seconds $delay
+      $what = if ($status) { "HTTP $status" } else { "no response ($($_.Exception.Message))" }
+      WriteLog "  RETRY   $what, attempt $attempt of $attempts, waiting $delay seconds" DarkYellow
+      if ($delay -gt 0) { Start-Sleep -Seconds $delay }
     }
   }
 }
