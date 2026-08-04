@@ -7,18 +7,22 @@ holds the current operational state; this file is the design reasoning behind it
 
 ## Migration log
 
-**COMPLETE (2026-07-18). All five types, all five scopes, closed items included: 53,450 work items**
-in the ADO `Migration` project - 342 Epics, 535 Features, 7,660 Product Backlog Items, 706 Bugs,
-43,817 Tasks, 390 Impediments. Every item carries the `Custom.DigitalAI*` fields, a backdated
-two-point history (created-by / changed-by), area and iteration paths, and links (parent, Affects).
-The 535 Features are all parented; flattened Epics carry a Related link to their true Agility parent;
-no Dead template Epics leaked in. Close dates are real historical values.
+**COMPLETE (2026-08-04). All five types, all five scopes, closed items included: 53,705 work items**
+created by ONE `Migrate` call into an empty project, **0 skipped, 0 failed, in 13h 11m** - 342 Epics,
+535 Features, 7,694 Product Backlog Items, 711 Bugs, 44,030 Tasks, 393 Impediments. Every item
+carries the `Custom.DigitalAI*` fields, a backdated two-point history (created-by / changed-by), area
+and iteration paths, and links (parent, Affects, Successor/Predecessor). The 535 Features and all
+44,030 Tasks are parented with 0 broken links; flattened Epics carry a Related link to their true
+Agility parent; no Dead template Epics leaked in. Close dates are real historical values. Verified
+after the run by querying ADO: 43,283 `Removed`, 3,110 byte-exact attachments, 40,223 assigned,
+`ClosedBy` on 30,195, acceptance criteria on 6,565.
 
-The Task run took two attempts. The first full run failed all closed Tasks on `TF401320` (Closed Date
-Required - see [Close dates](#close-dates)); after the fix, `DeleteAllTasks` cleared them and a Task
-re-migration created 43,816 of 43,817, the one miss being `TK-01316` (empty `CreatedBy` VS402625
-edge, now fixed in code). See CLAUDE.md `## State` for the current snapshot and the one imperfect
-item.
+This replaced an earlier 53,450-item run (2026-07-18) whose project was deleted wholesale. Three
+failure modes were found and fixed between the two, each documented where its reasoning lives:
+`TF401320 Closed Date Required` (see [Close dates](#close-dates)), `TF401320 Closed By ReadOnly`
+(identity fields are read-only under process rules, so `ClosedBy` rides in the bypassRules create),
+and `TF201035` circular dependency links (moved out of the create so a cycle costs one link, not the
+item). See CLAUDE.md `## State` for the current snapshot.
 
 ## Goal
 

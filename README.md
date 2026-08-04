@@ -151,8 +151,15 @@ The script takes no parameters. Edit the calls in `Main` (the control panel) and
 # Migrate                            # the real migration, all types, all scopes
 # Migrate -Types Task                # one type
 # MaterializeOwners -DryRun          # optional: preview adding owners to the org as Stakeholders
+# RepairDependencyTags -DryRun       # find dependency tags whose partner has since been migrated
 # DeleteAllTasks -DryRun             # count Tasks (a delete helper for re-running just Tasks)
 ```
+
+There is a `DeleteAll<Type>` helper per work item type. Deletion is **permanent** (`destroy=true`),
+and it **orphans the children** of whatever you delete: links are written at create time only, so a
+child that survives is never re-linked to the re-created parent. Delete in reverse dependency order -
+Impediment, Task, Bug, Product Backlog Item, Feature, Epic - and re-migrate everything below whatever
+you removed.
 
 | Switch | Effect |
 |---|---|
@@ -191,7 +198,8 @@ Invoke-Pester -Path tests -Output Detailed
 - Targets the **Scrum** process; the Agile process needs `mappings.json` changes (User Story, StoryPoints).
 - Epics nested 3+ deep are flattened onto the top-level Epic, with the real parent kept as a Related link.
 - Custom fields must be created in your ADO process and listed in `mappings.json`.
-- Attachments, comments, and full change history are not migrated (two-point history only, since Agility's full-history endpoint is not always available).
+- Source comments (Conversations) and full change history are not migrated. History is two-point only - created-by/date and changed-by/date - because Agility's full-history endpoint is not available on every hosted instance. Attachments **are** migrated (see above).
+- Dependency links that form a cycle are rejected by ADO (`TF201035`). Each is skipped on its own, so the work items still migrate; only that one link is lost.
 - Agility descriptions are passed through as HTML without sanitizing.
 
 ## License
