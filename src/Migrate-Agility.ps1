@@ -67,16 +67,9 @@ function Main
   # RepairDependencyTags -DryRun                          # count stale agility-depends tags from an old run
   # RepairDependencyTags                                  # remove them (only where the partner IS in ADO)
   #
-  # Deletes are PERMANENT (destroy=true, no recycle bin) and take one type at a time. Always -DryRun
-  # first. Deleting a type ORPHANS whatever hangs off it - Features hang off Epics, PBIs and Bugs off
-  # Epics, Tasks off PBIs and Bugs - and a rerun only relinks items it CREATES, so plan to re-migrate
-  # the children too.
-  # DeleteAllEpics -DryRun                                # count; then drop -DryRun to delete
-  # DeleteAllFeatures -DryRun
-  # DeleteAllProductBacklogItems -DryRun
-  # DeleteAllBugs -DryRun
-  # DeleteAllTasks -DryRun
-  # DeleteAllImpediments -DryRun
+  # This script only ever creates and updates. Removing work items lives in Remove-WorkItems.ps1,
+  # a separate script that shares no code with this one, so no edit here can destroy anything.
+  #
   # Migrate -DryRun -Types Epic                           # 877 Epics and Features
   # Migrate -Types Epic                                   # the real Epic run
   # Migrate -DryRun -Types Story,Defect,Issue
@@ -564,135 +557,6 @@ function EntitleStakeholder([string]$email)
     return [pscustomobject]@{ Status = 'added'; Detail = $op.userId }
   }
   catch { return [pscustomobject]@{ Status = 'failed'; Detail = (ReadAdoError $_) } }
-}
-
-##################################################################################################
-# DeleteAllTasks - permanently delete every Task work item, to re-migrate them cleanly
-##################################################################################################
-
-# Deletes ONLY Task work items in the project, so a broken Task run can be redone. It exists because
-# a failed Task is still IN ADO (created, then a later patch failed), counted FAIL, and GetMigratedIdMap
-# would SKIP it on a rerun - leaving it broken forever. Removing the Tasks makes the rerun re-create
-# them. Epics, Features, PBIs, Bugs and Impediments are NOT touched.
-#
-# destroy=true is PERMANENT: the Tasks do not go to the recycle bin and cannot be recovered. That is
-# the intent (a clean slate for 40k+ Tasks would otherwise flood the bin). -DryRun reports the count
-# without deleting. The WHERE clause is hard pinned to System.WorkItemType = 'Task'; a test asserts it.
-# The ADO work item types these helpers are allowed to delete. An unrecognised name throws rather
-# than running a query whose type clause matches nothing (or, one careless edit later, everything).
-# This is the same rail as the Agility side's AssetState filter: the danger is the filter going
-# missing, and these destroy permanently.
-$script:DeletableAdoTypes = @('Epic', 'Feature', 'Product Backlog Item', 'Bug', 'Task', 'Impediment')
-
-function DeleteAllEpics([switch]$DryRun)               { DeleteAllOfType 'Epic'                 -DryRun:$DryRun }
-function DeleteAllFeatures([switch]$DryRun)            { DeleteAllOfType 'Feature'              -DryRun:$DryRun }
-function DeleteAllProductBacklogItems([switch]$DryRun) { DeleteAllOfType 'Product Backlog Item' -DryRun:$DryRun }
-function DeleteAllBugs([switch]$DryRun)                { DeleteAllOfType 'Bug'                  -DryRun:$DryRun }
-function DeleteAllTasks([switch]$DryRun)               { DeleteAllOfType 'Task'                 -DryRun:$DryRun }
-function DeleteAllImpediments([switch]$DryRun)         { DeleteAllOfType 'Impediment'           -DryRun:$DryRun }
-
-# Deletes every work item of ONE type in the project. The named wrappers above are the intended entry
-# points; this takes the type so the delete loop exists once rather than six times.
-function DeleteAllOfType([string]$adoType, [switch]$DryRun)
-{
-  if ($script:DeletableAdoTypes -notcontains $adoType)
-  {
-    throw "'$adoType' is not a work item type this can delete. Use one of: $($script:DeletableAdoTypes -join ', ')."
-  }
-
-  $script:DryRun = [bool]$DryRun
-  $deleted = 0
-  $failed = 0
-
-  StartLog
-  $script:runStarted = Get-Date
-  WriteLogDetail "DeleteAllOfType '$adoType' log, started $($script:runStarted.ToString('yyyy-MM-dd HH:mm:ss'))"
-  WriteLogDetail ""
-
-  $script:config = GetConfig $script:configPath
-
-  WriteLog "Deleting ALL $adoType work items in $($script:config.AzureDevOps.OrganizationUrl) project $($script:config.AzureDevOps.Project)"
-  if ($script:DryRun) { WriteLog "DRY RUN - nothing will be deleted" Yellow }
-  else { WriteLog "PERMANENT (destroy=true): these $adoType items CANNOT be recovered from the recycle bin" Red }
-  WriteLog
-
-  WriteLog "Resolving credentials..."
-  $script:adoHeaders = BuildAdoHeaders
-  WriteLog
-
-  $org = $script:config.AzureDevOps.OrganizationUrl.TrimEnd('/')
-  $ids = GetAllIdsOfType $adoType
-  WriteLog "Found $($ids.Count) $adoType work items"
-  WriteLog
-
-  if ($script:DryRun)
-  {
-    WriteLog "  WOULD delete $($ids.Count) $adoType items (destroy, permanent). First ids: $((@($ids) | Select-Object -First 10) -join ', ')"
-  }
-  else
-  {
-    $i = 0
-    foreach ($id in $ids)
-    {
-      $i++
-      $url = "$org/_apis/wit/workitems/$id`?destroy=true&api-version=7.1"
-      try
-      {
-        InvokeAdoRequest $url "Delete" $null $null | Out-Null
-        $deleted++
-      }
-      catch
-      {
-        WriteLog "  FAIL    #$id could not be deleted - $(ReadAdoError $_)" Red
-        WriteErrorDetail $_ "delete $adoType #$id"
-        $failed++
-      }
-
-      # Progress without a line per item: 40k lines would bury the log.
-      if ($i % 500 -eq 0) { WriteLog "  deleted $i / $($ids.Count)..." }
-    }
-  }
-
-  WriteLog
-  WriteLog "----------------------------------------"
-  WriteLog "$(if ($script:DryRun) { 'Would delete:' } else { 'Deleted: ' })  $(if ($script:DryRun) { $ids.Count } else { $deleted })"
-  WriteLog "Failed:   $failed"
-  WriteLog "----------------------------------------"
-  if ($script:logPath)
-  {
-    $elapsed = (Get-Date) - $script:runStarted
-    WriteLog "Log: $script:logPath" Cyan
-    WriteLogDetail "Finished $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')) after $([int]$elapsed.TotalMinutes)m $($elapsed.Seconds)s"
-  }
-}
-
-# Every id of one type in the project, walked with a System.Id watermark so it survives past the
-# 20,000 row WIQL cap (the same reason GetMigratedIdMap pages). $top keeps each query small and
-# steady. The type is quoted into the WHERE clause; a name with spaces ('Product Backlog Item')
-# needs no escaping beyond the single quotes WIQL already uses.
-function GetAllIdsOfType([string]$adoType)
-{
-  $org = $script:config.AzureDevOps.OrganizationUrl.TrimEnd('/')
-  $project = $script:config.AzureDevOps.Project
-  $pageSize = 1000
-  $ids = @()
-  $lastId = 0
-
-  while ($true)
-  {
-    $wiql = @{ query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '$project' AND [System.WorkItemType] = '$adoType' AND [System.Id] > $lastId ORDER BY [System.Id]" }
-    $url = "{0}/{1}/_apis/wit/wiql?`$top={2}&api-version=7.1" -f $org, [uri]::EscapeDataString($project), $pageSize
-
-    $response = InvokeAdoRequest $url "Post" $wiql "application/json"
-    $batch = @($response.workItems | ForEach-Object { $_.id })
-    if ($batch.Count -eq 0) { break }
-
-    $ids += $batch
-    $lastId = $batch[-1]
-    if ($batch.Count -lt $pageSize) { break }
-  }
-
-  return $ids
 }
 
 # Epics need their hierarchy resolved before anything is written, because the Epic/Feature split
@@ -1621,6 +1485,45 @@ function GetMigratedIdMap([int]$wiqlPageSize = 19000)
   }
 
   return $map
+}
+
+# Every work item id in the project, and nothing else. RepairDependencyTags needs the whole set so
+# it can read tags on the client, because WIQL cannot match a tag prefix at all.
+#
+# Paged on a System.Id watermark for the same reason GetMigratedIdMap is: WIQL caps a flat query at
+# 20,000 rows and fails the whole query with VS402337 rather than truncating, and this project holds
+# over 53,000. A watermark rather than an offset, which WIQL does not have, and which would drift if
+# items were created during the walk.
+#
+# No type filter. This used to walk the six work item types one at a time, off a list borrowed from
+# the delete helpers; those moved to Remove-WorkItems.ps1, and the loop was six queries returning
+# what one untyped query returns anyway. Anything in the project that is not a migrated item simply
+# fails the caller's tag test and is skipped.
+function GetAllWorkItemIds([int]$wiqlPageSize = 19000)
+{
+  $org = $script:config.AzureDevOps.OrganizationUrl.TrimEnd('/')
+  $project = $script:config.AzureDevOps.Project
+  $all = @()
+  $lastId = 0
+
+  while ($true)
+  {
+    $wiql = @{
+      query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '{0}' AND [System.Id] > {1} ORDER BY [System.Id]" -f $project, $lastId
+    }
+
+    $url = "{0}/{1}/_apis/wit/wiql?`$top={2}&api-version=7.1" -f $org, [uri]::EscapeDataString($project), $wiqlPageSize
+
+    $response = InvokeAdoRequest $url "Post" $wiql "application/json"
+    $ids = @($response.workItems | ForEach-Object { $_.id })
+    if ($ids.Count -eq 0) { break }
+
+    $all += $ids
+    $lastId = $ids[-1]
+    if ($ids.Count -lt $wiqlPageSize) { break }
+  }
+
+  return $all
 }
 
 # Reads a page of ids and folds their Agility Numbers into the map. Work item detail comes back in
@@ -2980,8 +2883,7 @@ function RepairDependencyTags([switch]$DryRun)
   WriteLog
 
   $org = $script:config.AzureDevOps.OrganizationUrl.TrimEnd('/')
-  $ids = @()
-  foreach ($t in $script:DeletableAdoTypes) { $ids += GetAllIdsOfType $t }
+  $ids = GetAllWorkItemIds
   WriteLog "Scanning $($ids.Count) work items for stale tags"
   WriteLog
 

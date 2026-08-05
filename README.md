@@ -152,14 +152,10 @@ The script takes no parameters. Edit the calls in `Main` (the control panel) and
 # Migrate -Types Task                # one type
 # MaterializeOwners -DryRun          # optional: preview adding owners to the org as Stakeholders
 # RepairDependencyTags -DryRun       # find dependency tags whose partner has since been migrated
-# DeleteAllTasks -DryRun             # count Tasks (a delete helper for re-running just Tasks)
 ```
 
-There is a `DeleteAll<Type>` helper per work item type. Deletion is **permanent** (`destroy=true`),
-and it **orphans the children** of whatever you delete: links are written at create time only, so a
-child that survives is never re-linked to the re-created parent. Delete in reverse dependency order -
-Impediment, Task, Bug, Product Backlog Item, Feature, Epic - and re-migrate everything below whatever
-you removed.
+`Migrate-Agility.ps1` only ever creates and updates. **Deleting work items is a separate script**,
+`Remove-WorkItems.ps1` - see [Removing work items](#removing-work-items) below.
 
 | Switch | Effect |
 |---|---|
@@ -185,11 +181,53 @@ Resolution order is **scope, then Theme, then Team**. The Team is a last resort:
 
 The parser has been validated against a live instance, but Agility response shapes vary by version. `ConvertFromAgilityAssets` is the only function that knows the wire format.
 
+## Removing work items
+
+Deleting is a **separate script**, `src/Remove-WorkItems.ps1`, and the separation is deliberate.
+The migration only ever creates and updates; this only ever destroys. Neither script loads, names,
+or shares a line of code with the other, so no edit to one can change what the other does. That is
+why the plumbing (config, secrets, ADO request, retry, logging) is duplicated rather than factored
+into a shared file, and tests assert the gap in both directions.
+
+Same shape as the migration: no parameters, edit the calls in `Main`, run it.
+
+```powershell
+./src/Remove-WorkItems.ps1
+```
+
+```powershell
+# DeleteAllImpediments -DryRun       # count; then drop -DryRun to delete
+# DeleteAllTasks -DryRun
+# DeleteAllBugs -DryRun
+# DeleteAllProductBacklogItems -DryRun
+# DeleteAllFeatures -DryRun
+# DeleteAllEpics -DryRun
+```
+
+Two things to know before you run it:
+
+- **Deletion is permanent.** `destroy=true` means items do not go to the recycle bin and cannot be
+  recovered. That is the intent - a clean slate for 40,000+ Tasks would otherwise flood the bin.
+  Always `-DryRun` first; the uncommented line in `Main` ships as a dry run.
+- **Deleting a type orphans its children.** Features hang off Epics; PBIs and Bugs off Epics; Tasks
+  off PBIs and Bugs. The parent link is written at create time only, so a surviving child is never
+  re-linked to a re-created parent. Delete in reverse dependency order - Impediment, Task, Bug,
+  Product Backlog Item, Feature, Epic - and re-migrate everything below whatever you removed.
+
+Each call writes its own log to `logs/Remove-WorkItems-<yyyyMMdd-HHmmss>.log`, named apart from the
+migration's so a destroy run is never mistaken for one. An unrecognised work item type throws rather
+than running a query whose type clause might match nothing, or everything.
+
 ## Tests
 
 ```powershell
 Invoke-Pester -Path tests -Output Detailed
 ```
+
+One test file per script - `Migrate-Agility.Tests.ps1` and `Remove-WorkItems.Tests.ps1`. Both are
+hermetic: nothing resolves a credential, queries the live instance, or writes a log file. The delete
+suite additionally asserts the air gap in both directions, so neither script can grow a reference to
+the other without a test failing.
 
 ## Limitations
 
