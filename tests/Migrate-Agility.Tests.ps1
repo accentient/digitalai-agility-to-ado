@@ -2245,6 +2245,43 @@ Describe "GetMigratedIdMap paging" {
     $script:seenQueries.Count | Should -Be 1
   }
 
+  # GetAllWorkItemIds is the same walk without the detail fetch. RepairDependencyTags used to get
+  # this set by looping the six work item types through the delete helpers' GetAllIdsOfType; those
+  # moved to Remove-WorkItems.ps1 on 2026-08-05, so the paging guarantee lives here now. It is not
+  # optional: a flat query past 20,000 rows fails with VS402337 rather than truncating, and this
+  # project holds over 53,000.
+  It "GetAllWorkItemIds walks every id with the same watermark, past the 20,000 row cap" {
+    $ids = GetAllWorkItemIds 100
+
+    @($ids).Count | Should -Be 250
+    $ids[0]   | Should -Be 1
+    $ids[-1]  | Should -Be 250
+
+    $script:seenQueries.Count | Should -Be 3
+    $script:seenQueries[0] | Should -Match '\[System\.Id\] > 0'
+    $script:seenQueries[1] | Should -Match '\[System\.Id\] > 100'
+    foreach ($q in $script:seenQueries) { $q | Should -Match 'ORDER BY \[System\.Id\]' }
+  }
+
+  # No type clause, deliberately: six typed queries returned exactly what one untyped query does.
+  # Anything that is not a migrated item fails the caller's agility-depends tag test and is skipped.
+  It "GetAllWorkItemIds filters by project only, not by work item type" {
+    GetAllWorkItemIds 100 | Out-Null
+
+    foreach ($q in $script:seenQueries)
+    {
+      $q | Should -Match "\[System\.TeamProject\] = 'Migration'"
+      $q | Should -Not -Match 'System\.WorkItemType'
+    }
+  }
+
+  It "GetAllWorkItemIds returns nothing for an empty project rather than looping" {
+    $script:fakeIds = @()
+
+    @(GetAllWorkItemIds 100).Count | Should -Be 0
+    $script:seenQueries.Count | Should -Be 1
+  }
+
   It "still matches the agility tags on the client, not in the WIQL" {
     GetMigratedIdMap 100 | Out-Null
 
@@ -4524,133 +4561,3 @@ Describe "MaterializeOwners: add recoverable owners to the org as free Stakehold
   }
 }
 
-##################################################################################################
-# The delete helpers: one per ADO work item type, over a shared core.
-#
-# What must never regress is what the type filter is FOR. These destroy permanently, so a query that
-# lost its type clause would take the whole project with it - the same class of hazard as the
-# AssetState filter on the Agility side, where dropping it would have migrated 18 templates.
-##################################################################################################
-Describe "Delete helpers: remove ONLY one type, so it can be re-migrated" {
-
-  BeforeAll {
-    $script:testConfig = [pscustomobject]@{
-      AzureDevOps = [pscustomobject]@{ OrganizationUrl = "https://dev.azure.com/contoso"; Project = "Migration" }
-    }
-    $script:config = $script:testConfig
-
-    # The query each wrapper actually sends, with nothing deleted.
-    function QueryOf([scriptblock]$call)
-    {
-      $script:queries = @()
-      Mock InvokeAdoRequest { $script:queries += $body.query; return [pscustomobject]@{ workItems = @() } }
-      & $call
-      return $script:queries[0]
-    }
-  }
-
-  # These call the real entry points, which read config, resolve credentials and open a log. Stub all
-  # three: a unit test must not touch the credential store, the live instance, or the logs directory.
-  BeforeEach {
-    Mock GetConfig       { return $script:testConfig }
-    Mock BuildAdoHeaders { return @{ Authorization = "Basic test" } }
-    Mock StartLog        { }
-    Mock WriteLog        { }
-    Mock WriteLogDetail  { }
-  }
-
-  It "sends a work item type filter for every wrapper, and the right one" {
-    $expected = @{
-      'DeleteAllEpics'               = 'Epic'
-      'DeleteAllFeatures'            = 'Feature'
-      'DeleteAllProductBacklogItems' = 'Product Backlog Item'
-      'DeleteAllBugs'                = 'Bug'
-      'DeleteAllTasks'               = 'Task'
-      'DeleteAllImpediments'         = 'Impediment'
-    }
-
-    foreach ($fn in $expected.Keys)
-    {
-      $query = QueryOf ([scriptblock]::Create("$fn -DryRun"))
-
-      $query | Should -Match ([regex]::Escape("[System.WorkItemType] = '$($expected[$fn])'")) `
-        -Because "$fn must delete only $($expected[$fn])"
-    }
-  }
-
-  # A wrapper must never match a type that is not its own.
-  It "never matches another type" {
-    (QueryOf { DeleteAllEpics -DryRun })    | Should -Not -Match "'Feature'"
-    (QueryOf { DeleteAllFeatures -DryRun }) | Should -Not -Match "'Epic'"
-    (QueryOf { DeleteAllBugs -DryRun })     | Should -Not -Match "'Task'"
-  }
-
-  # The rail that replaces "the type is hard coded": an unrecognised type must stop, not run a query
-  # with a filter that matches everything or nothing by accident.
-  It "throws on an unknown type rather than querying without a real filter" {
-    { DeleteAllOfType 'Widget' -DryRun } | Should -Throw -ExpectedMessage "*Widget*"
-    { DeleteAllOfType '' -DryRun }       | Should -Throw
-  }
-
-  It "always scopes to the configured project as well as the type" {
-    (QueryOf { DeleteAllTasks -DryRun }) | Should -Match "\[System\.TeamProject\] = 'Migration'"
-  }
-
-  It "destroys rather than recycling, so a rerun cannot find them by DigitalAIID" {
-    $source = Get-Content $script:scriptPath -Raw
-    $body = [regex]::Match($source, "function DeleteAllOfType\b[\s\S]*?(?=\r?\nfunction )").Value
-
-    $body | Should -Match 'destroy=true'
-    $body | Should -Match "InvokeAdoRequest .* `"Delete`""
-  }
-
-  It "deletes nothing on a dry run" {
-    $script:calls = @()
-    Mock InvokeAdoRequest {
-      $script:calls += $method
-      if ($method -eq 'Post') { return [pscustomobject]@{ workItems = @([pscustomobject]@{ id = 1 }) } }
-      return $null
-    }
-
-    DeleteAllEpics -DryRun
-
-    $script:calls | Should -Not -Contain 'Delete'
-  }
-
-  It "walks every item with a System.Id watermark, past the 20,000 row WIQL cap" {
-    # Two full pages of 1000, then a short page, then it stops. Ids are unique and ascending.
-    $script:call = 0
-    Mock InvokeAdoRequest {
-      $script:call++
-      $count = if ($script:call -le 2) { 1000 } elseif ($script:call -eq 3) { 3 } else { 0 }
-      $start = ($script:call - 1) * 1000
-      return [pscustomobject]@{ workItems = @(1..$count | ForEach-Object { [pscustomobject]@{ id = $start + $_ } }) }
-    }
-
-    $ids = GetAllIdsOfType 'Task'
-
-    @($ids).Count | Should -Be 2003
-    $ids[-1] | Should -Be 2003 -Because "the watermark keeps advancing past 20k"
-  }
-
-  It "asks for ids above the last one it saw, so no page is fetched twice" {
-    # A FULL first page (1000) forces a second query; its watermark must be the last id seen.
-    $script:queries = @()
-    Mock InvokeAdoRequest {
-      $script:queries += $body.query
-      if ($script:queries.Count -eq 1) { return [pscustomobject]@{ workItems = @(1..1000 | ForEach-Object { [pscustomobject]@{ id = $_ } }) } }
-      return [pscustomobject]@{ workItems = @() }
-    }
-
-    GetAllIdsOfType 'Task' | Out-Null
-
-    $script:queries[0] | Should -Match 'System\.Id\] > 0'
-    $script:queries[1] | Should -Match 'System\.Id\] > 1000'
-  }
-
-  # 'Product Backlog Item' contains spaces; the WIQL quoting has to survive that.
-  It "handles a type name with spaces" {
-    (QueryOf { DeleteAllProductBacklogItems -DryRun }) |
-      Should -Match ([regex]::Escape("[System.WorkItemType] = 'Product Backlog Item'"))
-  }
-}
