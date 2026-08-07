@@ -272,7 +272,7 @@
     },
     {
       "When": "Exact",
-      "Value": "Operations\\myClient",
+      "Value": "Operations\\Legacy App",
       "To": "Operations\\Apps"
     },
     {

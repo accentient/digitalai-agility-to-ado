@@ -1,0 +1,32 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  pester:
+    name: Pester
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          Install-Module Pester -MinimumVersion 5.0 -Force -Scope CurrentUser -SkipPublisherCheck
+          Import-Module Pester -MinimumVersion 5.0
+          (Get-Module Pester).Version.ToString()
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          # The suites are hermetic: no credential is resolved, no live instance is queried, and no
+          # log file is written, so nothing here needs secrets or CredentialManager.
+          $result = Invoke-Pester -Path tests -Output Detailed -PassThru
+          "Passed: $($result.PassedCount)  Failed: $($result.FailedCount)  Skipped: $($result.SkippedCount)"
+          if ($result.FailedCount -gt 0) { exit 1 }

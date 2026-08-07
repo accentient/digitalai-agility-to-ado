@@ -12,6 +12,10 @@ mappings.json
 TestResults/
 *.log
 
+# Run artifacts. The whole folder, not just *.log: runs also drop id lists and
+# other scratch files here, and one of those was tracked by accident.
+logs/
+
 # OS
 Thumbs.db
 .DS_Store
