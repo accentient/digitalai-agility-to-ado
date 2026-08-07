@@ -137,7 +137,8 @@ table above, and everything else in this repo, uses **API names**.
 The reliable way to tell which is which is the **Number prefix**: `E-` Epic, `S-` Story, `D-` Defect,
 `TK-` Task, `AT-` Test, `R-` Request, `I-` Issue.
 
-On the CWI instance the UI calls an `Issue` a **"Challenge"** and calls a `Defect` an **"Issue"**. So
+On one instance we migrated, the UI called an `Issue` a **"Challenge"** and called a `Defect` an
+**"Issue"**. So
 "Challenges become Impediments" and "Issues become Bugs" are already exactly what the table says -
 and a request to retarget the `Issue` type to Bug would move Challenges into Bugs and leave
 Impediment empty, the opposite of the intent. Field labels are renamed too; read `IsCustom` off
@@ -626,7 +627,7 @@ ADO, so the link cannot be made and the item is created unparented. That is corr
 link to a work item that does not exist. The parent Number survives as an `agility-parent:<Number>`
 tag, so nothing is silently lost and the link can be made later if that scope is ever migrated.
 
-The original example was `.edu conversion`: 24 Stories and 3 Defects pointed at six Closed Epics
+The original example was a conversion scope: 24 Stories and 3 Defects pointed at six Closed Epics
 (`E-02578`, `E-02580`, `E-02581`, `E-02582`, `E-02588`, `E-02639`) in a scope that was not
 configured. That scope **is** configured now (`Scope:16163`), so those particular items resolve when
 everything migrates together; the mechanism remains for any scope still left out. Adding a scope does

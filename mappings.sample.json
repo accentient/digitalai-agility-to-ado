@@ -272,7 +272,7 @@
     },
     {
       "When": "Exact",
-      "Value": "Operations\\myCWI",
+      "Value": "Operations\\Legacy App",
       "To": "Operations\\Apps"
     },
     {

@@ -1,20 +1,69 @@
-# agility-to-azuredevops
+# Digital.ai Agility to Azure DevOps Migrator
 
-A PowerShell tool that migrates work items one way, from [digital.ai Agility](https://digital.ai/products/agility/) (formerly VersionOne) into [Azure DevOps](https://azure.microsoft.com/en-us/products/devops). It reads from Agility and creates work items in an Azure DevOps project, preserving hierarchy, links, history, and traceability.
+[![Tests](https://github.com/accentient/digitalai-agility-to-ado/actions/workflows/tests.yml/badge.svg)](https://github.com/accentient/digitalai-agility-to-ado/actions/workflows/tests.yml)
+[![PowerShell 7+](https://img.shields.io/badge/PowerShell-7%2B-5391FE?logo=powershell&logoColor=white)](https://learn.microsoft.com/powershell/scripting/install/installing-powershell)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Agility is only ever read from. Every Agility call goes through a single function that hard codes `-Method Get`, so the tool has no code path that can modify anything in Agility. A test asserts this.
+A PowerShell tool that migrates work items one way, from [Digital.ai Agility](https://digital.ai/products/agility/)
+(formerly VersionOne and CollabNet VersionOne) into [Azure DevOps](https://azure.microsoft.com/products/devops).
+It reads from Agility and creates work items in an Azure DevOps project, preserving hierarchy, links,
+attachments, history, and traceability.
 
-## What it does
+It has migrated **53,683 work items in a single run** - all types, all scopes, closed items included.
 
-- Migrates Epics, Stories, Defects, Tasks, and Issues from an Agility instance via its REST API.
-- Maps Agility work item types, fields, states, and links to their Azure DevOps equivalents.
-- Preserves the **hierarchy** (parent/child), **Affects** links, area and iteration paths, and a **backdated two-point revision history** (created-by and last-changed-by, at their real dates).
-- Records each item's Agility number in a custom field, so reruns are **idempotent** and resumable.
-- Always validates a payload with a `-DryRun` (`validateOnly=true`) before writing.
+> **Agility is only ever read from.** Every Agility call goes through a single function that hard
+> codes `-Method Get`, so the tool has no code path that can modify anything in the source. Tests
+> assert this in both directions.
 
-## Work item type mapping
+## Features
 
-| digital.ai Agility | Azure DevOps (Scrum) |
+- Migrates **Epics, Stories, Defects, Tasks, and Issues** through Agility's REST API.
+- Maps work item types, fields, states, and links to their Azure DevOps equivalents, all configurable
+  in `mappings.json` without editing the script.
+- Preserves the **hierarchy**, dependency and Affects links, attachments, area and iteration paths,
+  and a **backdated two-point revision history** (created-by and last-changed-by, at their real dates).
+- Records each item's Agility number in a custom field, so runs are **idempotent and resumable** -
+  an interrupted migration just continues.
+- Validates every mapped state and field against Azure DevOps **before the first create**, so a
+  mapping mistake fails on call one rather than on item one of tens of thousands.
+- **`-DryRun` on everything.** Preview the whole migration without writing.
+
+## Supported versions
+
+Compatibility is governed by the API surface the tool uses, not by the product's branding. It calls
+only `rest-1.v1/Data` and `attachment.img` with an access token (Bearer auth) - a surface that has
+been stable across the product's entire rebranding history and carries no deprecation notice.
+
+### Source: Digital.ai Agility and its predecessors
+
+| Product name | Era | Status |
+|---|---|---|
+| **Digital.ai Agility** | Apr 2020 - present (20.x - 26.x) | **Verified** on 26.1.6.5, SaaS (`v1host.com`) |
+| CollabNet VersionOne | 2017 - Apr 2020 (17.x - 20.1) | Expected to work, not tested |
+| VersionOne / VersionOne Lifecycle | through 2017 | Expected to work, not tested |
+
+The product has been renamed twice: CollabNet merged with VersionOne in 2017, and on 15 April 2020
+CollabNet VersionOne, XebiaLabs, and Arxan combined as Digital.ai, making the product Digital.ai
+Agility. Versions are numbered `YY.Q` (three major releases a year through 24.3, four a year from
+25.0), and were also given season names in the VersionOne era - Winter 2018 is 18.1, Summer 2018 is
+18.2, Fall 2018 is 18.3.
+
+Digital.ai supports the current major release plus the two preceding it, so as of August 2026 only
+**26.2, 26.1, and 26.0** are vendor-supported and 25.3 and earlier are end of life. See the
+[Agility support matrix](https://docs.digital.ai/agility/docs/agility/support-matrix). The tool does
+not require a vendor-supported version.
+
+### Target: Azure DevOps
+
+| Platform | Status |
+|---|---|
+| **Azure DevOps Services**, Scrum process | **Verified** |
+| Azure DevOps Server | Expected to work, not tested |
+| Agile process | Needs `mappings.json` changes (User Story, StoryPoints) |
+
+## What gets migrated
+
+| Digital.ai Agility | Azure DevOps (Scrum) |
 |---|---|
 | Epic (Portfolio Item), top level | Epic |
 | Epic (Portfolio Item), nested | Feature |
@@ -23,93 +72,36 @@ Agility is only ever read from. Every Agility call goes through a single functio
 | Task | Task |
 | Issue | Impediment |
 
-**The UI may not use these names.** Agility instances can rename asset types, and the API only ever reports the internal one - no endpoint exposes the alias. The reliable tell is the work item's **Number prefix**: `E-` Epic, `S-` Story, `D-` Defect, `TK-` Task, `I-` Issue, `AT-` Test, `R-` Request. On the CWI instance the UI calls `Issue` a **Challenge** and calls `Defect` an **Issue**, so "Challenges become Impediments" and "Issues become Bugs" are already what the table above says.
+**Your UI may not use these names.** Agility instances can rename asset types, and the API only ever
+reports the internal one - no endpoint exposes the alias. The reliable tell is the work item's
+**Number prefix**: `E-` Epic, `S-` Story, `D-` Defect, `TK-` Task, `I-` Issue, `AT-` Test, `R-`
+Request. On one instance we migrated, the UI called an `Issue` a *Challenge* and called a `Defect` an
+*Issue* - so "Challenges become Impediments" and "Issues become Bugs" were already exactly what the
+table above says.
 
-Field, state, and value-map configuration lives in `mappings.json` and can be customized without editing the script. States are keyed per type, because ADO's states are per type (an Impediment has no `Done`; an Epic has no `Approved`).
+**[docs/migration-reference.md](docs/migration-reference.md)** has the full field mapping and the
+reasoning behind the non-obvious behavior: why nested Epics become Features, how close dates and the
+revision history are preserved, archiving long-finished work, recovering acceptance criteria from
+descriptions, attachments, identity resolution, and area path rules. **[docs/design.md](docs/design.md)**
+has the design rationale and the field audits.
 
-## Field mapping (overview)
+## Getting started
 
-| Agility | Azure DevOps |
-|---|---|
-| `Name` | `System.Title` (truncated at 255; full text kept in the description) |
-| `Number` | `Custom.DigitalAIID` (drives idempotency) and a Discussion comment on the migrated item |
-| `Description` | `System.Description` (HTML passed through) |
-| `Status` | `System.State` per type (closed-in-source lands closed, and long-finished work lands `Removed` - see below); raw status kept in `Custom.DigitalAIStatus` |
-| `Super` | parent link (Related link when flattened) |
-| `Scope` + `Theme` (+ `Team`) | `System.AreaPath` (scope path + Theme leaf; Tasks inherit their parent's Theme; the Team places items that would otherwise land at the project root) |
-| `Timebox` | `System.IterationPath` |
-| `Owners` | `System.AssignedTo` (first *assignable* owner); the rest to `Custom.DigitalAIOwners` |
-| `CreatedBy`/`CreateDate`, `ChangedBy`/`ChangeDate` | backdated `System.CreatedBy/CreatedDate` and `ChangedBy/ChangedDate` (two-point history) |
-| `ClosedDate` | `Microsoft.VSTS.Common.ClosedDate`, written inside the closing transition |
-| `Order` | `Microsoft.VSTS.Common.BacklogPriority` |
-| `Category`, `Custom_FiscalYear`, `Team`, `Custom_Mandate`, `StrategicThemes`, `ResolutionReason` | `Custom.DigitalAI*` fields (see `mappings.json` `CustomFields`); the multi-value ones are joined with `; ` |
-| `ClosedBy` | `Microsoft.VSTS.Common.ClosedBy`, in a rule-checked patch, only when ADO accepts the identity |
-| `TaggedWith` | `System.Tags` |
-| `Dependencies` / `Dependants` | Successor / Predecessor links (`System.LinkTypes.Dependency-*`) |
-| `Links` | `Hyperlink` relations (non-URL locations go to the description) |
-| `Attachments` | files downloaded from the source and uploaded to ADO as `AttachedFile` relations |
-| an "Acceptance Criteria" heading inside `Description` | `Microsoft.VSTS.Common.AcceptanceCriteria` (cloned, not moved - see below) |
-| `Personas`, `Risk`, `Reference`, `RequestedBy` | the description's "Agility details" block (no ADO field exists for these) |
-| `Category` | `Custom.DigitalAICategory`, collapsed onto the values that field accepts - plus a `Digital.ai category: <raw>` note at the bottom of the description for every item that has one |
-| `Issue.BlockedPrimaryWorkitems` / `BlockedEpics` ("blocks") | `Affects` links (`Microsoft.VSTS.Common.Affects-Forward`) |
-| `Issue.PrimaryWorkitems` ("relates to") | `Related` links (`System.LinkTypes.Related`) - the weaker association, so not `Affects` |
-| unmigrated parent / blocked item / related item / dependency / source | `agility-parent:` / `agility-blocks:` / `agility-relates:` / `agility-depends:` / `agility-source:` tags |
-
-`docs/design.md` has the full field audit and the reasoning behind these decisions.
-
-### Why nested Epics become Features
-
-Agility lets an Epic parent another Epic, to any depth. Azure DevOps does **not** reject an Epic parented to an Epic - it accepts the link and then [silently breaks the backlog](https://learn.microsoft.com/en-us/azure/devops/boards/backlogs/resolve-backlog-reorder-issues?view=azure-devops): reordering is disabled and intermediate items vanish from sprint backlogs. Because there is no error to catch, the tool resolves the hierarchy before writing: every Epic below the top level becomes a **Feature** under the top-level Epic. Epics nested 3+ deep are flattened onto the root, with the real parent preserved as a **Related** link and named in the description.
-
-### Close dates and the revision history
-
-The Scrum process owns `Closed Date` (auto-stamped on entry to a closed state). To keep the *real* historical date, and to backdate the created/changed revisions, the tool uses `bypassRules` on the create and the state transition. The close date is written **inside** the closing transition, so it is present before the rule-checked assignee patch runs (Task's `Done` requires a non-empty close date). `System.AssignedTo` is never sent in a `bypassRules` payload - it is set by a separate rule-checked patch, so a departed identity is rejected rather than stored. This needs a PAT whose identity holds bypass rights.
-
-### Archiving long-finished work
-
-Set `StaleAfterDays` in `mappings.json` and work that finished longer ago than that is created in its type's `StaleState` (`Removed`) instead of its `ClosedState`, so a decade of finished work doesn't arrive looking like a live backlog. The rule is deliberately narrow:
-
-- It only ever applies to an item that would **otherwise land in its closed state**. Nothing active or in progress is touched, however old it is.
-- It only applies to a type that **has** a `StaleState`. Impediment has no `Removed` state, so `Issue` is given none - the exclusion is missing config, not a hard-coded type check, and `AssertStatesExist` fails the run up front if anyone adds one.
-- Age comes from `ClosedDate`, falling back to `ChangeDate` then `CreateDate`. An item with **no date at all is never archived**: no evidence of age is not the same as being old.
-- The cutoff is resolved **once per run**, so every item is measured against the same instant.
-- The real close date still rides along on the transition. `Removed` accepts `Closed Date` and does not require it (verified live on Epic, PBI, Bug and Task), so nothing is lost and no date is ever fabricated for it.
-
-Omit the key, or set it to zero or less, and the rule is off. **Azure DevOps hides `Removed` items from backlogs, boards, and default queries** - that is the point of archiving, but it is worth knowing before a run puts most of your items there. `-DryRun` prints `state=` per item and the summary counts how many would be removed, so check that number before writing.
-
-### Acceptance criteria are recovered from the description
-
-Agility has **no acceptance criteria attribute on any type** - people write them into the description under a heading. The tool finds that heading and **clones** the section into `Microsoft.VSTS.Common.AcceptanceCriteria`, leaving the text in the description as well, so nothing moves and nothing is lost.
-
-The section runs from the heading to the next heading (a real `<h1-6>`, a paragraph that is only short bold text, or a short plain paragraph ending in a colon - all three occur in real data), or to the end of the description. Orphaned closing tags and trailing spacer paragraphs are trimmed, and a heading with nothing under it writes no field at all.
-
-`Acceptance Criteria` is matched case-insensitively with an optional colon. `AC` is honoured **only in heading position** - preceded by a block tag and followed by a colon - because in the measured corpus every standalone `AC` in prose was something else entirely ("no MS or `AC` line"). Matching it loosely would be all false positives. The field only exists on Epic, Feature, Product Backlog Item and Bug, so Task and Impediment are skipped rather than having the write silently dropped.
-
-### Attachments
-
-Files are **copied**, not referenced: the source keeps them behind an authenticated endpoint, so each one is downloaded and re-uploaded into the ADO project's attachment store, then linked as an `AttachedFile` relation with a comment naming the source item.
-
-Copying is deliberately non-fatal. The work item already exists by then, so a file that won't move produces a warning and a count rather than losing the item, and each file is handled independently. Anything over 60 MB (ADO's default cap) is skipped with a warning. A `-DryRun` downloads nothing and just reports `attachments=N` per item; the run summary reports files copied and failed separately from item counts.
-
-The binary path is worth one note for anyone modifying it: PowerShell enumerates a collection on output, so a `byte[]` returned through a pipeline silently becomes an `Object[]` of boxed bytes with an identical `.Length`, and uploading that corrupts the file. `InvokeAgilityDownload` guards against this and a test asserts the returned value really is a `byte[]`.
-
-### Owners and identities
-
-Owners are matched by **email** (emails are not reliably derivable from names). ADO only accepts `AssignedTo` identities that are members of your organization, so the tool probes each owner (cached `validateOnly`) and assigns the **first one ADO accepts**, trying each owner then the item's creator. Owners it can't assign go to `Custom.DigitalAIOwners`. A directory user who is not yet an org member is rejected by the REST API even though the web picker can assign them (which quietly adds them to the org); the `MaterializeOwners` helper can add such owners as free Stakeholders up front if you want them assigned.
-
-## Prerequisites
+### Prerequisites
 
 - [PowerShell 7](https://learn.microsoft.com/powershell/scripting/install/installing-powershell) or later
-- A digital.ai Agility **access token** (Agility → member profile → Applications)
-- An Azure DevOps **PAT** with Work Items (Read & Write) scope. `Closed Date` and the backdated history need an identity with **bypass rules** rights.
-- [CredentialManager](https://www.powershellgallery.com/packages/CredentialManager) if you store tokens in Windows Credential Manager: `Install-Module CredentialManager -Scope CurrentUser`
-- [Pester](https://pester.dev) 5+ for the tests: `Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -SkipPublisherCheck`
+- A Digital.ai Agility **access token** (Agility → member profile → Applications)
+- An Azure DevOps **PAT** with Work Items (Read & Write) scope. Close dates and the backdated history
+  need an identity with **bypass rules** rights.
+- [CredentialManager](https://www.powershellgallery.com/packages/CredentialManager), if you store
+  tokens in Windows Credential Manager: `Install-Module CredentialManager -Scope CurrentUser`
 
-## Configuration
+### Configuration
 
-Two config files are gitignored so your instance-specific details stay out of source control. Copy the samples and fill in your values:
+Two config files are gitignored so your instance-specific details stay out of source control. Copy
+the samples and fill in your values:
 
-```
+```powershell
 cp appsettings.sample.json appsettings.json
 cp mappings.sample.json mappings.json
 ```
@@ -117,20 +109,19 @@ cp mappings.sample.json mappings.json
 | File | Committed | Holds |
 |---|---|---|
 | `appsettings.sample.json` | Yes | Placeholder instance URLs, scopes, org, project. |
-| `appsettings.json` | No (gitignored) | Your real instance details. **No tokens** - only credential-target names. |
-| `mappings.sample.json` | Yes | Generic type/field/state config + example value maps. |
-| `mappings.json` | No (gitignored) | Your type/field/state config and your instance's value maps. |
+| `appsettings.json` | No | Your real instance details. **No tokens** - only credential-target names. |
+| `mappings.sample.json` | Yes | Generic type/field/state config and example value maps. |
+| `mappings.json` | No | Your type/field/state config and your instance's value maps. |
 
-### Tokens
-
-Tokens resolve from an environment variable first, then Windows Credential Manager:
+Tokens are never stored in the repo. They resolve from an environment variable first, then Windows
+Credential Manager:
 
 | Token | Environment variable | Credential Manager target |
 |---|---|---|
 | Agility access token | `AGILITY_ACCESS_TOKEN` | the `Agility.CredentialTarget` value |
 | Azure DevOps PAT | `ADO_PAT` | the `AzureDevOps.CredentialTarget` value |
 
-Store a token in Windows Credential Manager from your own terminal (keeps it out of shell history):
+To store one in Windows Credential Manager from your own terminal (keeping it out of shell history):
 
 ```powershell
 Import-Module CredentialManager
@@ -139,18 +130,16 @@ New-StoredCredential -Target "ADO-YourOrg-PAT" -UserName "pat" `
   -SecurePassword $token -Persist LocalMachine -Type Generic
 ```
 
-## Usage
+### Usage
 
-The script takes no parameters. Edit the calls in `Main` (the control panel) and run it:
+The script takes no parameters. `Main` is the control panel: edit the calls, then run it.
 
 ```powershell
 ./src/Migrate-Agility.ps1
 ```
 
-`Main` exposes a menu of operations you uncomment one at a time:
-
 ```powershell
-# CreateAreaPaths -DryRun            # list the area nodes the scopes/Themes need
+# CreateAreaPaths -DryRun            # list the area nodes your scopes/Themes need
 # CreateAreaPaths                    # create them (run before migrating Stories/Defects/Tasks)
 # Migrate -DryRun                    # preview everything, writes nothing
 # Migrate                            # the real migration, all types, all scopes
@@ -159,44 +148,26 @@ The script takes no parameters. Edit the calls in `Main` (the control panel) and
 # RepairDependencyTags -DryRun       # find dependency tags whose partner has since been migrated
 ```
 
-`Migrate-Agility.ps1` only ever creates and updates. **Deleting work items is a separate script**,
-`Remove-WorkItems.ps1` - see [Removing work items](#removing-work-items) below.
-
 | Switch | Effect |
 |---|---|
 | `-DryRun` | Print what would happen. Writes nothing to Azure DevOps. |
 | `-Scope` | Narrow to one configured scope. Cross-scope parents will not resolve. |
 | `-Types` | Which Agility types to migrate. Defaults to all five. Order is always Epic → Story → Defect → Task → Issue regardless of what you pass, so children find their parents. |
 
-**`Migrate` without `-DryRun` writes to Azure DevOps.** Preview first.
+**Run `-DryRun` first.** It prints the type, title, parent link, area path, state, priority, and
+assignee for every item and asks Azure DevOps to validate each payload (`validateOnly=true`), so
+field problems surface as `INVALID` before anything is written. A dry run validates the create; the
+state transition, links, and close date need a real item, so they are not covered.
 
-**Closed items always migrate.** There is no switch for it: every real run wanted them, so the option was removed rather than left as a trap. Items whose source `AssetState` is *Dead* are the one exclusion - those are placeholder templates and are never created.
-
-Before the first create, the tool checks every mapped state and field against what ADO reports for each type, so a mapping mistake fails on call one, not on item one of tens of thousands. It's idempotent and resumable: items are matched by `Custom.DigitalAIID` and skipped, so an interrupted run just continues.
-
-### Area paths
-
-Each scope maps to an ADO area path; Stories/Defects add a Theme leaf below it. **The nodes must exist** or ADO rejects the item (`TF401347`). `CreateAreaPaths` builds exactly the nodes your data needs (derived live, closed items included) - run it after adding a scope, a `ThemeAreaPaths` entry, or a `TeamAreaPaths` target, before the migration that needs them.
-
-**`AreaPathRemap` folds the composed path onto a fixed tree.** After the scope and Theme produce a path, an ordered rule list in `mappings.json` remaps it onto the tree you actually want, so the migration never creates nodes outside it (`CreateAreaPaths` applies the same remap). Rules carry their own kind - `Exact`, `Prefix` ("this node or below"), or `Contains` - and are evaluated in order, first match wins, so a specific exception can be written above a general rule. That ordering is load bearing: an exact rule for a `Networking - COVID` node has to sit above a `Contains COVID` rule, or the general rule swallows it. An unrecognised rule kind throws rather than silently matching nothing. This is applied *after* composition rather than by editing `ThemeAreaPaths`, because a target can depend on the scope as well as the Theme - the same Theme under two scopes can need two different destinations.
-
-Resolution order is **scope, then Theme, then Team**. The Team is a last resort: it is consulted only when an item would otherwise land at the bare project root, which happens when its scope has no area path of its own and it carries no Theme. `TeamAreaPaths` is matched **exactly**, never by prefix or substring - team names frequently contain node names (a team called `User Services - Sprint` contains the node name `User Services`), so a text match looks right and then mis-files the first team named after something that is not a node. Derive the entries from where each team's work actually lives, and leave a team out when the data doesn't say; an unmapped team stays at the root, exactly like an unmapped Theme.
-
-## Validate before you migrate
-
-**Run `-DryRun` first.** It prints the type, title, parent link, area path, state, priority, and assignee for every item, asks ADO to validate each payload (`validateOnly=true`) so field problems surface as `INVALID` before any write, and writes nothing to either system. A dry run validates the create; the state transition, links, and close date need a real item, so they aren't covered - but the states themselves are checked against ADO's own list on every run.
-
-The parser has been validated against a live instance, but Agility response shapes vary by version. `ConvertFromAgilityAssets` is the only function that knows the wire format.
+**Closed items always migrate.** There is no switch for it - every real run wanted them, so the
+option was removed rather than left as a trap. Items whose source `AssetState` is *Dead* are the one
+exclusion; those are placeholder templates and are never created.
 
 ## Removing work items
 
-Deleting is a **separate script**, `src/Remove-WorkItems.ps1`, and the separation is deliberate.
-The migration only ever creates and updates; this only ever destroys. Neither script loads, names,
-or shares a line of code with the other, so no edit to one can change what the other does. That is
-why the plumbing (config, secrets, ADO request, retry, logging) is duplicated rather than factored
-into a shared file, and tests assert the gap in both directions.
-
-Same shape as the migration: no parameters, edit the calls in `Main`, run it.
+Deleting is a **separate script**, and the separation is deliberate. The migration only ever creates
+and updates; this only ever destroys. Neither script loads, names, or shares a line of code with the
+other, so no edit to one can change what the other does. Tests assert the gap in both directions.
 
 ```powershell
 ./src/Remove-WorkItems.ps1
@@ -213,17 +184,12 @@ Same shape as the migration: no parameters, edit the calls in `Main`, run it.
 
 Two things to know before you run it:
 
-- **Deletion is permanent.** `destroy=true` means items do not go to the recycle bin and cannot be
-  recovered. That is the intent - a clean slate for 40,000+ Tasks would otherwise flood the bin.
-  Always `-DryRun` first; the uncommented line in `Main` ships as a dry run.
-- **Deleting a type orphans its children.** Features hang off Epics; PBIs and Bugs off Epics; Tasks
-  off PBIs and Bugs. The parent link is written at create time only, so a surviving child is never
-  re-linked to a re-created parent. Delete in reverse dependency order - Impediment, Task, Bug,
-  Product Backlog Item, Feature, Epic - and re-migrate everything below whatever you removed.
-
-Each call writes its own log to `logs/Remove-WorkItems-<yyyyMMdd-HHmmss>.log`, named apart from the
-migration's so a destroy run is never mistaken for one. An unrecognised work item type throws rather
-than running a query whose type clause might match nothing, or everything.
+- **Deletion is permanent.** Items do not go to the recycle bin and cannot be recovered. Always
+  `-DryRun` first; the uncommented line in `Main` ships as a dry run.
+- **Deleting a type orphans its children.** The parent link is written at create time only, so a
+  surviving child is never re-linked to a re-created parent. Delete in reverse dependency order -
+  Impediment, Task, Bug, Product Backlog Item, Feature, Epic - and re-migrate everything below
+  whatever you removed.
 
 ## Tests
 
@@ -231,21 +197,41 @@ than running a query whose type clause might match nothing, or everything.
 Invoke-Pester -Path tests -Output Detailed
 ```
 
-One test file per script - `Migrate-Agility.Tests.ps1` and `Remove-WorkItems.Tests.ps1`. Both are
-hermetic: nothing resolves a credential, queries the live instance, or writes a log file. The delete
-suite additionally asserts the air gap in both directions, so neither script can grow a reference to
-the other without a test failing.
+One test file per script. Both suites are hermetic: nothing resolves a credential, queries a live
+instance, or writes a log file, so they run anywhere. They also run on every push and pull request
+(see the badge above).
 
 ## Limitations
 
-- One-way migration only (Agility to Azure DevOps).
-- `Closed Date` and the backdated history need a PAT identity with rule-bypass rights.
-- Targets the **Scrum** process; the Agile process needs `mappings.json` changes (User Story, StoryPoints).
-- Epics nested 3+ deep are flattened onto the top-level Epic, with the real parent kept as a Related link.
-- Custom fields must be created in your ADO process and listed in `mappings.json`.
-- Source comments (Conversations) and full change history are not migrated. History is two-point only - created-by/date and changed-by/date - because Agility's full-history endpoint is not available on every hosted instance. Attachments **are** migrated (see above).
-- Dependency links that form a cycle are rejected by ADO (`TF201035`). Each is skipped on its own, so the work items still migrate; only that one link is lost.
+- One-way migration only, Agility to Azure DevOps. There is no sync and no delta mode: an
+  already-migrated item is skipped before any field is compared, so later source edits are not
+  brought across.
+- Close dates and the backdated history need a PAT identity with rule-bypass rights.
+- Targets the **Scrum** process; the Agile process needs `mappings.json` changes.
+- Epics nested 3+ deep are flattened onto the top-level Epic, with the real parent kept as a Related
+  link.
+- Custom fields must be created in your Azure DevOps process and listed in `mappings.json`.
+- Source comments (Conversations) and full change history are not migrated. History is two-point only
+  - created-by/date and changed-by/date - because Agility's full-history endpoint is not available on
+  every hosted instance. Attachments **are** migrated.
+- Dependency links that form a cycle are rejected by Azure DevOps (`TF201035`). Each is skipped on
+  its own, so the work items still migrate; only that one link is lost.
 - Agility descriptions are passed through as HTML without sanitizing.
+
+## Migration consulting
+
+A migration of any size is rarely just a script run - scoping, field mapping, process design, and
+deciding what *not* to bring across are usually the hard parts. If you would like help planning or
+running one, get in touch.
+
+**Richard Hundhausen** · [richard@accentient.com](mailto:richard@accentient.com) · [Accentient](https://accentient.com)
+
+## Contributing
+
+Bug reports and pull requests are welcome through
+[GitHub Issues](https://github.com/accentient/digitalai-agility-to-ado/issues). When reporting a
+problem, please include your Agility version, the relevant section of your `mappings.json` with any
+instance-specific values removed, and the log excerpt from `logs/` - **never a token**.
 
 ## License
 
