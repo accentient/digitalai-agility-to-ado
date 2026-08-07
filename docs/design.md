@@ -7,22 +7,43 @@ holds the current operational state; this file is the design reasoning behind it
 
 ## Migration log
 
-**COMPLETE (2026-08-04). All five types, all five scopes, closed items included: 53,705 work items**
-created by ONE `Migrate` call into an empty project, **0 skipped, 0 failed, in 13h 11m** - 342 Epics,
-535 Features, 7,694 Product Backlog Items, 711 Bugs, 44,030 Tasks, 393 Impediments. Every item
-carries the `Custom.DigitalAI*` fields, a backdated two-point history (created-by / changed-by), area
-and iteration paths, and links (parent, Affects, Successor/Predecessor). The 535 Features and all
-44,030 Tasks are parented with 0 broken links; flattened Epics carry a Related link to their true
-Agility parent; no Dead template Epics leaked in. Close dates are real historical values. Verified
-after the run by querying ADO: 43,283 `Removed`, 3,110 byte-exact attachments, 40,223 assigned,
-`ClosedBy` on 30,195, acceptance criteria on 6,565.
+**COMPLETE (2026-08-05/06). All five types, all five scopes, closed items included: 53,683 work
+items** created by ONE `Migrate` call into an empty project, **0 skipped, 0 failed, in 13h 50m** -
+342 Epics, 535 Features, 7,702 Product Backlog Items, 712 Bugs, 43,999 Tasks, 393 Impediments. Every
+item carries the `Custom.DigitalAI*` fields, a backdated two-point history (created-by / changed-by),
+area and iteration paths, and links (parent, Affects, Related, Successor/Predecessor). Close dates
+are real historical values; no Dead template Epics leaked in.
 
-This replaced an earlier 53,450-item run (2026-07-18) whose project was deleted wholesale. Three
-failure modes were found and fixed between the two, each documented where its reasoning lives:
+**A full relationship audit after the run** compared every link against Agility, using the
+migration's own parser and `ResolveEpicHierarchy` so the expectation was what the migration should
+have produced: 49,474 parent links with **0 wrong**, **0 same-category parent links**, 533 Affects,
+390 Related pairs (334 flattened-Epic true parents + 56 Challenge relates-to), 8,696 of 8,706
+dependency ends, and **0 dangling** out of 109,488 link targets checked. The 10 missing dependency
+ends are 5 cyclic pairs ADO refuses (`TF201035`) - Agility permits cycles, ADO does not. Also
+verified: 43,353 `Removed`, 3,114 attachments with 0 failures.
+
+This replaced a 53,705-item run (2026-08-04) and, before that, a 53,450-item run (2026-07-18). Four
+failure modes were found and fixed across them, each documented where its reasoning lives:
 `TF401320 Closed Date Required` (see [Close dates](#close-dates)), `TF401320 Closed By ReadOnly`
 (identity fields are read-only under process rules, so `ClosedBy` rides in the bypassRules create),
-and `TF201035` circular dependency links (moved out of the create so a cycle costs one link, not the
-item). See CLAUDE.md `## State` for the current snapshot.
+`TF201035` circular dependency links (moved out of the create so a cycle costs one link, not the
+item), and a **run set that could not see across type boundaries** - `RecordNumbersInRun` was filled
+per type, so a Story depending on a Defect (migrated later) was wrongly tagged `agility-depends`;
+152 items on the 2026-08-05/06 run, since fixed by `RecordAllNumbersInRun` and repaired. See
+CLAUDE.md `## State` for the current snapshot.
+
+**Deleting is a separate, air-gapped script.** `src/Migrate-Agility.ps1` only ever creates and
+updates; `src/Remove-WorkItems.ps1` only ever destroys. Neither loads, names, or shares code with
+the other, and tests assert the gap in both directions. The plumbing is duplicated deliberately: a
+shared file would give the two a common blast radius, which is an air gap in name only. See
+`docs/superpowers/specs/2026-08-05-remove-workitems-air-gap-design.md`.
+
+**It is a migration, not a sync.** An already-migrated item is matched by `Custom.DigitalAIID` and
+skipped *before any field is compared*, so later Agility edits, state changes, and new links between
+existing items are never brought across, and items deleted in Agility are never removed from ADO.
+Links are only ever written when an item is created. This is what makes a 13-hour run safely
+resumable; a delta-sync mode would need change detection (`ChangeDateUTC` is already selected), an
+update path, and a conflict rule, none of which exist.
 
 ## Goal
 
@@ -105,6 +126,25 @@ The target project uses the Scrum process.
 | Story (Backlog Item) | Product Backlog Item |
 | Defect | Bug |
 | Task | Task |
+| Issue | Impediment |
+
+### The UI's names are not the API's names
+
+An Agility instance can rename its asset types, and **nothing in the API exposes the alias** -
+`meta.v1` reports internal names only, `loc.v1` is a 400 and `loc-2.v1` returns an empty string. The
+table above, and everything else in this repo, uses **API names**.
+
+The reliable way to tell which is which is the **Number prefix**: `E-` Epic, `S-` Story, `D-` Defect,
+`TK-` Task, `AT-` Test, `R-` Request, `I-` Issue.
+
+On the CWI instance the UI calls an `Issue` a **"Challenge"** and calls a `Defect` an **"Issue"**. So
+"Challenges become Impediments" and "Issues become Bugs" are already exactly what the table says -
+and a request to retarget the `Issue` type to Bug would move Challenges into Bugs and leave
+Impediment empty, the opposite of the intent. Field labels are renamed too; read `IsCustom` off
+`meta.v1/{Type}` to tell a stock attribute from a renamed local one.
+
+**Before searching the API for a type or field a user names, ask for a Number prefix or an example
+item.** Searching 186 declared type names for "Challenge" finds nothing and proves nothing.
 
 ### Bug behavior
 
