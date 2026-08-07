@@ -55,12 +55,17 @@ function Main
   # DeleteAllProductBacklogItems -DryRun
   # DeleteAllFeatures -DryRun
   # DeleteAllEpics -DryRun
-  #
   # DeleteAllTasks                                        # the real thing, ~44,000 items, no undo
   #
   # Creating work items lives in Migrate-Agility.ps1, which is air gapped from this script.
 
-  DeleteAllTasks -DryRun
+  # DeleteAllImpediments
+  DeleteAllTasks
+  DeleteAllBugs
+  DeleteAllProductBacklogItems
+  DeleteAllFeatures
+  DeleteAllEpics
+
 }
 
 ##################################################################################################

@@ -1085,6 +1085,12 @@ Describe "Agility id and status go to fields, not tags" {
         Epic = [pscustomobject]@{ DefaultState = "New"; ClosedState = "Done"; Map = [pscustomobject]@{ "In Progress" = "In Progress" } }
       }
       Priorities = [pscustomobject]@{ DefaultPriority = 2; Map = [pscustomobject]@{} }
+      CategoryMap = @(
+        [pscustomobject]@{ When = "Contains"; Value = "Operational Plan";     To = "Operational" },
+        [pscustomobject]@{ When = "Contains"; Value = "Colleague";            To = "Operational Enhancement" },
+        [pscustomobject]@{ When = "Exact";    Value = "External IT Requests"; To = "External Request" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operational";          To = "Operational" }
+      )
     }
     $script:config = [pscustomobject]@{ AzureDevOps = [pscustomobject]@{ Project = "Migration" } }
     $script:numberByOid = @{}
@@ -1138,10 +1144,19 @@ Describe "Agility id and status go to fields, not tags" {
 
   # Category was an agility-category: tag until the user added Custom.DigitalAICategory to
   # every type. A tag would be a second, drifting copy of the same fact.
-  It "writes the Agility Category to Custom.DigitalAICategory" {
+  # Changed 2026-08-05: the field no longer takes the RAW Agility category. It holds one of the three
+  # values the field accepts, or nothing at all. The raw value is not lost - BuildCategoryNote puts
+  # it at the bottom of the description for every item that has one.
+  It "writes the MAPPED Agility category to Custom.DigitalAICategory" {
+    $patch = BuildFieldPatch (NewFieldItem @{ Category = "External IT Requests" })
+
+    ($patch | Where-Object { $_.path -eq "/fields/Custom.DigitalAICategory" }).value | Should -Be "External Request"
+  }
+
+  It "writes an empty category when the raw value is not one of the three" {
     $patch = BuildFieldPatch (NewFieldItem @{ Category = "Applications" })
 
-    ($patch | Where-Object { $_.path -eq "/fields/Custom.DigitalAICategory" }).value | Should -Be "Applications"
+    ($patch | Where-Object { $_.path -eq "/fields/Custom.DigitalAICategory" }).value | Should -Be ""
   }
 
   # Mirrors the raw-status field: always present, so a query on it always means something and an
@@ -2939,6 +2954,657 @@ Describe "Issue blocking links" {
 
     $result.Ids | Should -Not -Contain $script:DryRunPendingId
     $result.Ids.Count | Should -Be 0
+  }
+}
+
+##################################################################################################
+# Agility has TWO relationships between an Issue (a "Challenge" in the UI) and a work item, and
+# they are not the same thing:
+#
+#   BlockedPrimaryWorkitems / BlockedEpics   "this blocks that"      -> Affects      (already done)
+#   PrimaryWorkitems                         "this relates to that"  -> Related      (added here)
+#
+# The weaker one was dropped entirely until now: 58 links across 42 Issues, every target a Story or
+# a Defect. Related is the right ADO link because the association carries no direction and no
+# blocking semantics, and unlike Dependency it has no acyclicity rule, so it is safe in the create.
+##################################################################################################
+##################################################################################################
+# Category and area path both became ORDERED RULE LISTS on 2026-08-05, because the user's rules are
+# not expressible as the flat name-to-name maps the rest of the file uses:
+#
+#   "everything EDU and below"  is a prefix rule
+#   "any COVID"                 is a contains rule
+#   "Networking - COVID"        is an EXACT rule that must beat the contains rule above
+#
+# Order is therefore load bearing, and the exception has to come before the general case. Every rule
+# kind is spelled out per rule (Exact / Prefix / Contains) rather than inferred, and an unrecognised
+# kind throws - the same rail as the delete whitelist, for the same reason: a matcher that silently
+# matches nothing looks exactly like a correct one.
+##################################################################################################
+##################################################################################################
+# Dependencies cross type boundaries, and the run-set has to as well (fixed 2026-08-06).
+#
+# RecordNumbersInRun is called per type inside MigrateWorkitems, so at the moment a Story is written
+# only Epics and Stories have been read. A Story that depends on a DEFECT therefore saw a partner
+# that was not in the tag map and not in the run set, reported it "not in Azure DevOps", and kept an
+# agility-depends tag - and then the Defect wrote the link from its own side anyway.
+#
+# The 2026-08-05/06 run left 152 items in exactly that state. Verified against ADO afterwards: 40 of
+# 40 sampled carried BOTH the tag and the link it claimed was missing. RecordAllNumbersInRun fills
+# the set for every type before any item migrates.
+##################################################################################################
+Describe "The run set covers every type before anything migrates" {
+
+  BeforeAll {
+    $script:config = [pscustomobject]@{
+      Agility = [pscustomobject]@{ BaseUrl = "https://v1host.example/CWI" }
+    }
+  }
+
+  BeforeEach {
+    $script:numbersInRun = @{}
+    $script:urls = @()
+    Mock WriteLog { }
+
+    # One short page per type/scope, so the walk stops after one call each.
+    Mock InvokeAgilityGet {
+      $script:urls += $url
+      $type = [regex]::Match($url, '/Data/(\w+)\?').Groups[1].Value
+      $prefix = @{ Epic = 'E'; Story = 'S'; Defect = 'D'; Task = 'TK'; Issue = 'I' }[$type]
+      return [pscustomobject]@{
+        Assets = @(1..2 | ForEach-Object {
+          [pscustomobject]@{ Attributes = [pscustomobject]@{ Number = [pscustomobject]@{ value = "$prefix-0$_" } } }
+        })
+      }
+    }
+  }
+
+  It "records numbers for every type, not just the one being migrated" {
+    RecordAllNumbersInRun @('Epic', 'Story', 'Defect') @([pscustomobject]@{ Scope = 'Scope:1' })
+
+    $script:numbersInRun.ContainsKey('E-01') | Should -BeTrue
+    $script:numbersInRun.ContainsKey('S-01') | Should -BeTrue
+    $script:numbersInRun.ContainsKey('D-01') | Should -BeTrue -Because "a Story depends on Defects migrated after it"
+  }
+
+  It "walks every configured scope" {
+    RecordAllNumbersInRun @('Story') @(
+      [pscustomobject]@{ Scope = 'Scope:1' },
+      [pscustomobject]@{ Scope = 'Scope:2' }
+    )
+
+    @($script:urls | Where-Object { $_ -match 'Scope%3A1' }).Count | Should -BeGreaterThan 0
+    @($script:urls | Where-Object { $_ -match 'Scope%3A2' }).Count | Should -BeGreaterThan 0
+  }
+
+  # Recording a Dead template's number would claim the run creates it, suppressing a warning that
+  # is actually correct. This is the same rail as the migration read itself.
+  It "never drops the Dead filter" {
+    RecordAllNumbersInRun @('Story') @([pscustomobject]@{ Scope = 'Scope:1' })
+
+    foreach ($u in $script:urls)
+    {
+      $u | Should -Match 'AssetState' -Because "a query with no Dead filter would record placeholder templates"
+    }
+  }
+
+  # Only the Number, so this stays a cheap extra pass rather than a second full read of a 13 hour run.
+  It "asks for the Number alone" {
+    RecordAllNumbersInRun @('Story') @([pscustomobject]@{ Scope = 'Scope:1' })
+
+    $script:urls[0] | Should -Match 'sel=Number'
+    $script:urls[0] | Should -Not -Match 'Description'
+  }
+
+  # The real defect, end to end: a Defect partner read up front is no longer reported missing.
+  It "stops a cross-type partner being reported as not in Azure DevOps" {
+    RecordAllNumbersInRun @('Epic', 'Story', 'Defect') @([pscustomobject]@{ Scope = 'Scope:1' })
+
+    $story = [pscustomobject]@{ DependencyNumbers = @('D-01'); DependantNumbers = @() }
+    $result = ResolveDependencyIds $story @{}
+
+    $result.Unresolved.Count | Should -Be 0 -Because "D-01 is created later in this same run"
+  }
+
+  It "still reports a partner that is genuinely outside the configured scopes" {
+    RecordAllNumbersInRun @('Story') @([pscustomobject]@{ Scope = 'Scope:1' })
+
+    $story = [pscustomobject]@{ DependencyNumbers = @('D-99'); DependantNumbers = @() }
+
+    (ResolveDependencyIds $story @{}).Unresolved | Should -Be @('D-99')
+  }
+
+  # Migrate must fill the set before the first item is written, or the fix does nothing.
+  It "is called by Migrate before any type is migrated" {
+    $source = Get-Content $script:scriptPath -Raw
+    $body = [regex]::Match($source, "function Migrate\(\[switch\]\`$DryRun[\s\S]*?(?=\r?\nfunction )").Value
+
+    $body | Should -Match 'RecordAllNumbersInRun'
+    $callIndex    = $body.IndexOf('RecordAllNumbersInRun')
+    $migrateIndex = $body.IndexOf('MigrateWorkitems')
+    $callIndex | Should -BeLessThan $migrateIndex -Because "the run set must be complete before anything is written"
+  }
+}
+
+Describe "Category mapping and the description note" {
+
+  BeforeAll {
+    $script:mappings = [pscustomobject]@{
+      RequiredFields = [pscustomobject]@{ AgilityCategory = "Custom.DigitalAICategory" }
+      CategoryMap = @(
+        [pscustomobject]@{ When = "Contains"; Value = "Operational Plan";     To = "Operational" },
+        [pscustomobject]@{ When = "Contains"; Value = "Colleague";            To = "Operational Enhancement" },
+        [pscustomobject]@{ When = "Exact";    Value = "External IT Requests"; To = "External Request" },
+        [pscustomobject]@{ When = "Exact";    Value = "External Request";     To = "External Request" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operational";          To = "Operational" }
+      )
+      States = [pscustomobject]@{
+        Story = [pscustomobject]@{
+          DefaultState = "New"; ClosedState = "Done"; StaleState = "Removed"
+          Map = [pscustomobject]@{ "In Progress" = "In Progress" }
+        }
+      }
+    }
+  }
+
+  # The three values the field is allowed to hold. Anything else must map to nothing at all, so the
+  # field stays writable if it is ever locked down to a picklist of exactly these.
+  # Pairs, not a hashtable: PowerShell hash literal keys are case-INSENSITIVE, so 'Operational Plan'
+  # and 'operational plan' collide and the file will not even parse.
+  It "maps only onto the three configured values, or onto nothing" {
+    $cases = @(
+      @('Operational Plan',                 'Operational'),
+      @('operational plan',                 'Operational'),
+      @('OPERATIONAL PLAN',                 'Operational'),
+      @('Operational',                      'Operational'),
+      @('Colleague Integration - Internal', 'Operational Enhancement'),
+      @('Colleague Integration - Vendor',   'Operational Enhancement'),
+      @('External IT Requests',             'External Request'),
+      @('External Request',                 'External Request')
+    )
+
+    foreach ($case in $cases)
+    {
+      MapCategoryValue $case[0] | Should -Be $case[1] -Because "'$($case[0])' should map to $($case[1])"
+    }
+  }
+
+  # Measured live: these are every other Category value in the instance. The description note is
+  # the record for them; the field stays empty.
+  It "leaves every other category unmapped" {
+    foreach ($raw in @('IT Program', 'Design', 'Policy', 'Security Program', 'Epic', 'Feature', 'Sub-Feature'))
+    {
+      MapCategoryValue $raw | Should -BeNullOrEmpty -Because "'$raw' is not one of the three values"
+    }
+  }
+
+  It "returns nothing for an absent category" {
+    MapCategoryValue $null | Should -BeNullOrEmpty
+    MapCategoryValue ''    | Should -BeNullOrEmpty
+    MapCategoryValue '   ' | Should -BeNullOrEmpty
+  }
+
+  # "Operational Plan" contains "Operational"; the bare-word rule must not swallow it, and the
+  # contains rule must not swallow the bare word.
+  It "keeps Operational and Operational Plan distinct from each other" {
+    MapCategoryValue 'Operational Plan' | Should -Be 'Operational'
+    MapCategoryValue 'Operational'      | Should -Be 'Operational'
+  }
+
+  It "trims surrounding whitespace before matching" {
+    MapCategoryValue '  External Request  ' | Should -Be 'External Request'
+  }
+
+  # A Removed item keeps the description note and nothing else, by request.
+  It "writes no category field on an item heading for Removed" {
+    # 128 is Agility's closed AssetState. IsAgilityClosed tests for that number, NOT for the word
+    # "Closed" - a fixture saying 'Closed' reads as ACTIVE and the item never becomes stale.
+    $stale = [pscustomobject]@{
+      AgilityType = 'Story'; Number = 'S-1'; Category = 'Operational'
+      AssetState = '128'; ClosedDate = '2019-01-01'
+    }
+    $script:staleBefore = [datetime]'2025-08-05'
+
+    ResolveCategoryField $stale | Should -Be ''
+  }
+
+  It "writes the mapped category on an item that is not Removed" {
+    $script:staleBefore = $null
+    $live = [pscustomobject]@{ AgilityType = 'Story'; Number = 'S-2'; Category = 'Operational'; AssetState = 'Active' }
+
+    ResolveCategoryField $live | Should -Be 'Operational'
+  }
+
+  It "writes an empty category when the value does not map" {
+    $script:staleBefore = $null
+    $live = [pscustomobject]@{ AgilityType = 'Story'; Number = 'S-3'; Category = 'IT Program'; AssetState = 'Active' }
+
+    ResolveCategoryField $live | Should -Be ''
+  }
+
+  # The category rule must never be the thing that makes a patch throw: a fixture or a type with no
+  # state mapping still has to produce a category.
+  It "does not throw when the item's type has no state mapping" {
+    $script:staleBefore = $null
+    { ResolveCategoryField ([pscustomobject]@{ AgilityType = 'Nonesuch'; Category = 'Operational' }) } | Should -Not -Throw
+  }
+
+  It "appends the category note to the bottom of the description" {
+    $note = BuildCategoryNote ([pscustomobject]@{ Category = 'Sub-Feature' })
+
+    $note | Should -Match 'Digital\.ai category'
+    $note | Should -Match 'Sub-Feature'
+  }
+
+  It "writes no note when there is no category" {
+    BuildCategoryNote ([pscustomobject]@{ Category = $null }) | Should -BeNullOrEmpty
+    BuildCategoryNote ([pscustomobject]@{ Category = '' })    | Should -BeNullOrEmpty
+  }
+
+  # The note is the ONLY record for an unmapped or Removed item, so it must not depend on mapping.
+  It "notes a category that does not map, and one on a Removed item" {
+    BuildCategoryNote ([pscustomobject]@{ Category = 'IT Program' }) | Should -Match 'IT Program'
+  }
+
+  It "html encodes the category so markup cannot break the description" {
+    BuildCategoryNote ([pscustomobject]@{ Category = 'A & B <x>' }) | Should -Match 'A &amp; B'
+  }
+
+  It "puts the note at the very bottom, after the Agility details block" {
+    $script:staleBefore = $null
+    $description = BuildDescription ([pscustomobject]@{
+      Description = '<p>body</p>'; Number = 'S-1'; AgilityType = 'Story'
+      Category = 'Operational'; Timebox = 'Sprint 1'
+    }) $null
+
+    $description | Should -Match 'Digital\.ai category'
+    # Nothing may follow it.
+    $description.TrimEnd() | Should -Match 'Digital\.ai category:</b> Operational</p>$'
+  }
+}
+
+Describe "Area path remapping onto the fixed IT tree" {
+
+  BeforeAll {
+    $script:mappings = [pscustomobject]@{
+      ThemeAreaPaths = [pscustomobject]@{ Colleague = "Colleague"; AV = "AV" }
+      AreaPathRemap = @(
+        [pscustomobject]@{ When = "Prefix";   Value = "EDU";                                  To = "" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operations\Networking - COVID";         To = "Operations\Networking" },
+        [pscustomobject]@{ When = "Contains"; Value = "COVID";                                 To = "" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operations\Blackboard";                 To = "Operations\Apps" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operations\Colleague";                  To = "Operations\Apps" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operations\myCWI";                      To = "Operations\Apps" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operations\Security";                   To = "Operations\Apps" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operations\Databases";                  To = "Operations\DevOps" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operations\Infrastructure";             To = "Operations\DevOps" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operations\IT OPS";                     To = "Operations" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operations\IT User Services";           To = "User Services" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operations\Other";                      To = "Operations" },
+        [pscustomobject]@{ When = "Exact";    Value = "User Services\Audio Visual - CARES Act"; To = "User Services\AV" }
+      )
+    }
+  }
+
+  # Every area path in use in the project on 2026-08-05, and where the rules send it. This is the
+  # whole specification in one table: if a rule is reordered or dropped, a row here fails.
+  It "sends all 29 live area paths to the right node" {
+    $expected = @{
+      ''                                          = ''
+      'EDU'                                       = ''
+      'EDU\Apps'                                  = ''
+      'EDU\Colleague'                             = ''
+      'EDU\Databases'                             = ''
+      'EDU\Infrastructure'                        = ''
+      'EDU\myCWI'                                 = ''
+      'EDU\Networking'                            = ''
+      'EDU\Other'                                 = ''
+      'EDU\System'                                = ''
+      'Operations'                                = 'Operations'
+      'Operations\Apps'                           = 'Operations\Apps'
+      'Operations\Blackboard'                     = 'Operations\Apps'
+      'Operations\Colleague'                      = 'Operations\Apps'
+      'Operations\Databases'                      = 'Operations\DevOps'
+      'Operations\Infrastructure'                 = 'Operations\DevOps'
+      'Operations\IT OPS'                         = 'Operations'
+      'Operations\IT User Services'               = 'User Services'
+      'Operations\myCWI'                          = 'Operations\Apps'
+      'Operations\Networking'                     = 'Operations\Networking'
+      'Operations\Networking - COVID'             = 'Operations\Networking'
+      'Operations\Other'                          = 'Operations'
+      'Operations\Security'                       = 'Operations\Apps'
+      'Operations\System'                         = 'Operations\System'
+      'User Services'                             = 'User Services'
+      'User Services\Audio Visual - CARES Act'    = 'User Services\AV'
+      'User Services\AV'                          = 'User Services\AV'
+      'User Services\COVID-19 Grants'             = ''
+      'User Services\COVID-19 Response'           = ''
+    }
+
+    foreach ($from in $expected.Keys)
+    {
+      RemapAreaPath $from | Should -Be $expected[$from] -Because "'$from' should land on '$($expected[$from])'"
+    }
+  }
+
+  # The one place order decides the answer. Networking - COVID contains COVID, and the generic COVID
+  # rule sends things to the root, so the exact rule has to be evaluated first.
+  It "keeps Networking - COVID out of the generic COVID rule" {
+    RemapAreaPath 'Operations\Networking - COVID' | Should -Be 'Operations\Networking'
+    RemapAreaPath 'User Services\COVID-19 Grants' | Should -Be ''
+  }
+
+  # Prefix must mean "this node or below", not "starts with these letters".
+  It "does not treat a longer name as being under EDU" {
+    RemapAreaPath 'EDUCATION'       | Should -Be 'EDUCATION'
+    RemapAreaPath 'EDU'             | Should -Be ''
+    RemapAreaPath 'EDU\Anything'    | Should -Be ''
+  }
+
+  It "leaves a path no rule matches untouched" {
+    RemapAreaPath 'Operations\Something New' | Should -Be 'Operations\Something New'
+    RemapAreaPath ''                         | Should -Be ''
+  }
+
+  # ResolveAreaPath composes scope + theme and THEN remaps, so the rules are written against the
+  # tree as it exists rather than against every scope/theme combination.
+  It "applies the remap to what ResolveAreaPath composes" {
+    ResolveAreaPath 'Operations' 'Colleague' $null | Should -Be 'Operations\Apps'
+    ResolveAreaPath 'EDU' 'Colleague' $null        | Should -Be ''
+    ResolveAreaPath 'User Services' 'AV' $null     | Should -Be 'User Services\AV'
+  }
+
+  # A rule kind nobody implemented must stop the run, not quietly match nothing.
+  It "throws on an unrecognised rule kind rather than silently matching nothing" {
+    $script:mappings.AreaPathRemap = @([pscustomobject]@{ When = "Regex"; Value = "x"; To = "y" })
+
+    { RemapAreaPath 'anything' } | Should -Throw -ExpectedMessage "*Regex*"
+  }
+}
+
+##################################################################################################
+# The Status values that are really Kanban columns (2026-08-05). Measured across the instance, most
+# of these sit on CLOSED items where ClosedState wins and Status is ignored - so the map matters for
+# the handful that are active, and as insurance for the rest.
+#
+# There is no "Ready" state on a Product Backlog Item or a Bug: ADO offers New, Approved, In
+# Progress, Done, Removed. Approved is Scrum's ready-to-be-pulled state, so "Ready" means Approved
+# here. AssertStatesExist proves every target against ADO before the first create.
+##################################################################################################
+Describe "Kanban-style statuses map to real ADO states" {
+
+  BeforeAll {
+    $script:mappings = [pscustomobject]@{
+      StaleAfterDays = 365
+      States = [pscustomobject]@{
+        Story = [pscustomobject]@{
+          DefaultState = "New"; ClosedState = "Done"; StaleState = "Removed"
+          Map = [pscustomobject]@{
+            "Not Started" = "New"; "Ready" = "Approved"; "Committed" = "Approved"
+            "In Progress" = "In Progress"; "On Hold" = "In Progress"
+            "Done" = "Done"; "Completed" = "Done"; "Done Done" = "Done"
+            "Accepted" = "Approved"; "Future" = "New"
+            "Systems" = "In Progress"; "Applications" = "In Progress"; "Network" = "In Progress"
+            "Development" = "In Progress"; "On order" = "In Progress"; "On Deck" = "In Progress"
+            "Training" = "In Progress"; "Vendor" = "In Progress"
+          }
+        }
+        Defect = [pscustomobject]@{
+          DefaultState = "New"; ClosedState = "Done"; StaleState = "Removed"
+          Map = [pscustomobject]@{
+            "Not Started" = "Approved"; "In Progress" = "In Progress"
+            "Applications" = "In Progress"; "Development" = "In Progress"; "Network" = "In Progress"
+            "Done Done" = "Done"; "Completed" = "Done"; "Done" = "Done"
+          }
+        }
+      }
+    }
+  }
+
+  BeforeEach { $script:staleBefore = $null }
+
+  It "maps every configured Product Backlog Item status" {
+    $cases = @{
+      'Committed' = 'Approved'; 'Accepted' = 'Approved'; 'Future' = 'New'
+      'Systems' = 'In Progress'; 'Applications' = 'In Progress'; 'Network' = 'In Progress'
+      'On Hold' = 'In Progress'; 'Development' = 'In Progress'; 'On order' = 'In Progress'
+      'On Deck' = 'In Progress'; 'Training' = 'In Progress'; 'Vendor' = 'In Progress'
+      'Done Done' = 'Done'
+    }
+
+    foreach ($status in $cases.Keys)
+    {
+      $item = [pscustomobject]@{ AgilityType = 'Story'; Status = $status; AssetState = 'Active' }
+      MapState $item | Should -Be $cases[$status] -Because "Story '$status' should be $($cases[$status])"
+    }
+  }
+
+  It "maps every configured Bug status" {
+    $cases = @{
+      'Not Started' = 'Approved'; 'Applications' = 'In Progress'
+      'Development' = 'In Progress'; 'Network' = 'In Progress'
+    }
+
+    foreach ($status in $cases.Keys)
+    {
+      $item = [pscustomobject]@{ AgilityType = 'Defect'; Status = $status; AssetState = 'Active' }
+      MapState $item | Should -Be $cases[$status] -Because "Bug '$status' should be $($cases[$status])"
+    }
+  }
+
+  # Every target has to be a state the type actually has, or the run dies at AssertStatesExist.
+  It "never maps to a state Product Backlog Item and Bug do not have" {
+    $real = @('New', 'Approved', 'In Progress', 'Done', 'Removed')
+
+    foreach ($type in @('Story', 'Defect'))
+    {
+      $spec = $script:mappings.States.$type
+      foreach ($p in $spec.Map.PSObject.Properties)
+      {
+        $real | Should -Contain $p.Value -Because "$type '$($p.Name)' maps to '$($p.Value)', which is not a real state"
+      }
+      $real | Should -Contain $spec.DefaultState
+      $real | Should -Contain $spec.ClosedState
+      $real | Should -Contain $spec.StaleState
+    }
+  }
+
+  # The >1 year rule already fires on the MAPPED state, so a status-driven Done archives exactly the
+  # same way an AssetState-driven one does. That needed no new code, and this pins it.
+  It "sends a status-driven Done to Removed when it finished over a year ago" {
+    $script:staleBefore = [datetime]'2025-08-05'
+    $old = [pscustomobject]@{ AgilityType = 'Story'; Status = 'Done Done'; AssetState = 'Active'; ClosedDate = '2019-03-01' }
+
+    MapState $old | Should -Be 'Removed'
+  }
+
+  It "leaves a recently finished status-driven Done as Done" {
+    $script:staleBefore = [datetime]'2025-08-05'
+    $recent = [pscustomobject]@{ AgilityType = 'Story'; Status = 'Done Done'; AssetState = 'Active'; ClosedDate = '2026-07-01' }
+
+    MapState $recent | Should -Be 'Done'
+  }
+
+  # An In Progress item is never archived however old, because the rule only fires on the closed state.
+  It "never archives a Kanban status that maps to In Progress" {
+    $script:staleBefore = [datetime]'2025-08-05'
+    $old = [pscustomobject]@{ AgilityType = 'Story'; Status = 'Vendor'; AssetState = 'Active'; ClosedDate = '2010-01-01' }
+
+    MapState $old | Should -Be 'In Progress'
+  }
+}
+
+Describe "Issue associated links become Related" {
+
+  BeforeAll {
+    $script:mappings = [pscustomobject]@{
+      LinkTypes = [pscustomobject]@{
+        Parent  = "System.LinkTypes.Hierarchy-Reverse"
+        Related = "System.LinkTypes.Related"
+        Blocks  = "Microsoft.VSTS.Common.Affects-Forward"
+      }
+    }
+    $script:config = [pscustomobject]@{ AzureDevOps = [pscustomobject]@{ OrganizationUrl = "https://dev.azure.com/org" } }
+  }
+
+  It "reads PrimaryWorkitems into the associated list" {
+    $response = @'
+{
+  "Assets": [
+    {
+      "id": "Issue:1",
+      "Attributes": {
+        "Number": { "value": "I-1" },
+        "PrimaryWorkitems.Number": { "value": ["S-01", "D-02"] }
+      }
+    }
+  ]
+}
+'@ | ConvertFrom-Json
+
+    $parsed = ConvertFromAgilityAssets $response 'Issue'
+
+    $parsed[0].AssociatedNumbers.Count | Should -Be 2
+    $parsed[0].AssociatedNumbers | Should -Contain "S-01"
+    $parsed[0].AssociatedNumbers | Should -Contain "D-02"
+  }
+
+  It "leaves an Issue that relates to nothing with an empty list, not a null" {
+    $response = '{ "Assets": [ { "id": "Issue:2", "Attributes": { "Number": { "value": "I-2" } } } ] }' | ConvertFrom-Json
+
+    $parsed = ConvertFromAgilityAssets $response 'Issue'
+
+    $parsed[0].PSObject.Properties.Name | Should -Contain 'AssociatedNumbers'
+    $parsed[0].AssociatedNumbers.Count  | Should -Be 0
+  }
+
+  # Selecting an attribute Agility does not have is a 400 that kills the whole page, so the
+  # selection and the parser have to agree.
+  #
+  # The lookbehind is load bearing: the Issue selection ALREADY contains
+  # BlockedPrimaryWorkitems.Number, so a plain substring match passes before the attribute is
+  # added at all. It did, which is why this note exists.
+  It "asks Agility for the attribute the parser reads" {
+    GetSelection 'Issue' | Should -Match '(?<!Blocked)PrimaryWorkitems\.Number'
+  }
+
+  # Only Issue has it. PrimaryWorkitems on another type would be a different relationship.
+  It "does not ask for it on any other type" {
+    foreach ($t in @('Epic', 'Story', 'Defect', 'Task'))
+    {
+      GetSelection $t | Should -Not -Match '(?<!Blocked)PrimaryWorkitems\.Number' -Because "$t has no such association"
+    }
+  }
+
+  It "resolves associated numbers to the ADO ids they were migrated as" {
+    $item = [pscustomobject]@{ AssociatedNumbers = @("S-01", "D-02") }
+    $existing = @{ "S-01" = 111; "D-02" = 222 }
+
+    $result = ResolveAssociatedIds $item $existing @()
+
+    $result.Ids.Count | Should -Be 2
+    $result.Ids | Should -Contain 111
+    $result.Ids | Should -Contain 222
+    $result.Unresolved.Count | Should -Be 0
+  }
+
+  It "keeps an associated item that is not in ADO as unresolved rather than dropping it" {
+    $result = ResolveAssociatedIds ([pscustomobject]@{ AssociatedNumbers = @("S-01", "S-99") }) @{ "S-01" = 111 } @()
+
+    $result.Ids | Should -Be @(111)
+    $result.Unresolved | Should -Be @("S-99")
+  }
+
+  It "does not link the same item twice" {
+    (ResolveAssociatedIds ([pscustomobject]@{ AssociatedNumbers = @("S-01", "S-01") }) @{ "S-01" = 111 } @()).Ids.Count |
+      Should -Be 1
+  }
+
+  It "separates an item this run would create from one that is genuinely missing" {
+    $existing = @{ "S-01" = 111; "S-02" = $script:DryRunPendingId }
+
+    $result = ResolveAssociatedIds ([pscustomobject]@{ AssociatedNumbers = @("S-01", "S-02", "S-99") }) $existing @()
+
+    $result.Ids        | Should -Be @(111)
+    $result.Pending    | Should -Be @("S-02")
+    $result.Unresolved | Should -Be @("S-99")
+  }
+
+  It "never puts the pending marker in the ids that become links" {
+    $result = ResolveAssociatedIds ([pscustomobject]@{ AssociatedNumbers = @("S-02") }) @{ "S-02" = $script:DryRunPendingId } @()
+
+    $result.Ids | Should -Not -Contain $script:DryRunPendingId
+    $result.Ids.Count | Should -Be 0
+  }
+
+  # Measured on the live instance: 2 Issues both BLOCK and RELATE TO the same work item. Writing
+  # both links would put an Affects and a Related between the same pair, which is redundant rather
+  # than informative - Affects already says everything Related would. The stronger link wins.
+  It "does not add a Related link where an Affects link already covers the same pair" {
+    $item = [pscustomobject]@{ AssociatedNumbers = @("S-01", "S-02") }
+    $existing = @{ "S-01" = 111; "S-02" = 222 }
+
+    $result = ResolveAssociatedIds $item $existing @(111)
+
+    $result.Ids | Should -Be @(222) -Because "111 is already linked as Affects"
+  }
+
+  It "still reports a suppressed duplicate as neither unresolved nor pending" {
+    $result = ResolveAssociatedIds ([pscustomobject]@{ AssociatedNumbers = @("S-01") }) @{ "S-01" = 111 } @(111)
+
+    $result.Ids.Count        | Should -Be 0
+    $result.Unresolved.Count | Should -Be 0
+    $result.Pending.Count    | Should -Be 0
+  }
+
+  # The op builder is shared with the Affects links so the relation shape exists in one place.
+  It "builds a relation op with the link type, the url and a comment" {
+    $ops = @(BuildLinkOps "System.LinkTypes.Related" @(101) "Associated with Agility I-1.")
+
+    $ops.Count                       | Should -Be 1
+    $ops[0].op                       | Should -Be "add"
+    $ops[0].path                     | Should -Be "/relations/-"
+    $ops[0].value.rel                | Should -Be "System.LinkTypes.Related"
+    $ops[0].value.url                | Should -Match "101$"
+    $ops[0].value.attributes.comment | Should -Be "Associated with Agility I-1."
+  }
+
+  It "builds one op per id and nothing at all for an empty list" {
+    @(BuildLinkOps "System.LinkTypes.Related" @(1, 2, 3) "c").Count | Should -Be 3
+    @(BuildLinkOps "System.LinkTypes.Related" @() "c").Count        | Should -Be 0
+    @(BuildLinkOps "System.LinkTypes.Related" $null "c").Count      | Should -Be 0
+  }
+
+  # Related has no acyclicity rule, unlike Dependency, so it is safe in the create alongside Affects.
+  It "writes the associated links in the create, like Affects and unlike dependencies" {
+    $source = Get-Content $script:scriptPath -Raw
+    $body = [regex]::Match($source, "function NewAdoWorkItem\b[\s\S]*?(?=\r?\nfunction )").Value
+
+    $body | Should -Match 'associatedIds'
+    $body | Should -Not -Match 'LinkTypes\.Successor'
+    $body | Should -Not -Match 'LinkTypes\.Predecessor'
+  }
+
+  It "passes the associated ids from MigrateItem into the create" {
+    $source = Get-Content $script:scriptPath -Raw
+    $body = [regex]::Match($source, "function MigrateItem\b[\s\S]*?(?=\r?\nfunction )").Value
+
+    $body | Should -Match 'ResolveAssociatedIds'
+    $body | Should -Match 'NewAdoWorkItem .*\$associated\.Ids'
+  }
+
+  # Same rule as an unmigrated parent or an unmigrated blocked item: the link cannot be made, so the
+  # number is kept as a tag rather than the relationship vanishing.
+  It "tags an associated item that is not in Azure DevOps" {
+    $tags = BuildTags ([pscustomobject]@{ AgilityType = 'Issue'; Number = 'I-1'; AssociatedUnresolved = @('S-99') })
+
+    $tags | Should -BeLike "*agility-relates:S-99*"
+  }
+
+  It "does not tag an association that did resolve" {
+    $tags = BuildTags ([pscustomobject]@{ AgilityType = 'Issue'; Number = 'I-1'; AssociatedUnresolved = @() })
+
+    "$tags" | Should -Not -Match 'agility-relates'
   }
 }
 

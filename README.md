@@ -23,6 +23,8 @@ Agility is only ever read from. Every Agility call goes through a single functio
 | Task | Task |
 | Issue | Impediment |
 
+**The UI may not use these names.** Agility instances can rename asset types, and the API only ever reports the internal one - no endpoint exposes the alias. The reliable tell is the work item's **Number prefix**: `E-` Epic, `S-` Story, `D-` Defect, `TK-` Task, `I-` Issue, `AT-` Test, `R-` Request. On the CWI instance the UI calls `Issue` a **Challenge** and calls `Defect` an **Issue**, so "Challenges become Impediments" and "Issues become Bugs" are already what the table above says.
+
 Field, state, and value-map configuration lives in `mappings.json` and can be customized without editing the script. States are keyed per type, because ADO's states are per type (an Impediment has no `Done`; an Epic has no `Approved`).
 
 ## Field mapping (overview)
@@ -48,7 +50,10 @@ Field, state, and value-map configuration lives in `mappings.json` and can be cu
 | `Attachments` | files downloaded from the source and uploaded to ADO as `AttachedFile` relations |
 | an "Acceptance Criteria" heading inside `Description` | `Microsoft.VSTS.Common.AcceptanceCriteria` (cloned, not moved - see below) |
 | `Personas`, `Risk`, `Reference`, `RequestedBy` | the description's "Agility details" block (no ADO field exists for these) |
-| unmigrated parent / blocked item / dependency / source | `agility-parent:` / `agility-blocks:` / `agility-depends:` / `agility-source:` tags |
+| `Category` | `Custom.DigitalAICategory`, collapsed onto the values that field accepts - plus a `Digital.ai category: <raw>` note at the bottom of the description for every item that has one |
+| `Issue.BlockedPrimaryWorkitems` / `BlockedEpics` ("blocks") | `Affects` links (`Microsoft.VSTS.Common.Affects-Forward`) |
+| `Issue.PrimaryWorkitems` ("relates to") | `Related` links (`System.LinkTypes.Related`) - the weaker association, so not `Affects` |
+| unmigrated parent / blocked item / related item / dependency / source | `agility-parent:` / `agility-blocks:` / `agility-relates:` / `agility-depends:` / `agility-source:` tags |
 
 `docs/design.md` has the full field audit and the reasoning behind these decisions.
 
@@ -172,6 +177,8 @@ Before the first create, the tool checks every mapped state and field against wh
 ### Area paths
 
 Each scope maps to an ADO area path; Stories/Defects add a Theme leaf below it. **The nodes must exist** or ADO rejects the item (`TF401347`). `CreateAreaPaths` builds exactly the nodes your data needs (derived live, closed items included) - run it after adding a scope, a `ThemeAreaPaths` entry, or a `TeamAreaPaths` target, before the migration that needs them.
+
+**`AreaPathRemap` folds the composed path onto a fixed tree.** After the scope and Theme produce a path, an ordered rule list in `mappings.json` remaps it onto the tree you actually want, so the migration never creates nodes outside it (`CreateAreaPaths` applies the same remap). Rules carry their own kind - `Exact`, `Prefix` ("this node or below"), or `Contains` - and are evaluated in order, first match wins, so a specific exception can be written above a general rule. That ordering is load bearing: an exact rule for a `Networking - COVID` node has to sit above a `Contains COVID` rule, or the general rule swallows it. An unrecognised rule kind throws rather than silently matching nothing. This is applied *after* composition rather than by editing `ThemeAreaPaths`, because a target can depend on the scope as well as the Theme - the same Theme under two scopes can need two different destinations.
 
 Resolution order is **scope, then Theme, then Team**. The Team is a last resort: it is consulted only when an item would otherwise land at the bare project root, which happens when its scope has no area path of its own and it carries no Theme. `TeamAreaPaths` is matched **exactly**, never by prefix or substring - team names frequently contain node names (a team called `User Services - Sprint` contains the node name `User Services`), so a text match looks right and then mis-files the first team named after something that is not a node. Derive the entries from where each team's work actually lives, and leave a team out when the data doesn't say; an unmapped team stays at the root, exactly like an unmapped Theme.
 
