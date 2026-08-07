@@ -174,7 +174,14 @@ function Migrate([switch]$DryRun, [string]$Scope, [string[]]$Types = @('Epic','S
 
   # Every Agility number this run reads, so a dependency partner that is merely not created YET is
   # not mistaken for one outside the configured scopes.
+  #
+  # Filled for EVERY type up front, not per type as each is read. Dependencies cross type
+  # boundaries: a Story depends on a Defect, and Defects migrate AFTER Stories, so at the moment a
+  # Story was written its partner had not been read and looked absent. The per-type fill left the
+  # 2026-08-05/06 run with 152 items tagged agility-depends for a link the Defect then wrote from
+  # its own side anyway - verified afterwards, 40 of 40 sampled had both the tag and the link.
   $script:numbersInRun = @{}
+  RecordAllNumbersInRun $Types $scopes
 
   # Dependency order, not the caller's order. Epics first so Stories and Defects can parent to
   # them; Tasks after both, since a Task parents to a Story or a Defect; Issues last, because the
@@ -237,7 +244,11 @@ function CreateAreaPaths([switch]$DryRun)
     WriteLog "--- $($s.Scope) -> $(FormatAreaPath $s.AreaPath) ---" Cyan
 
     # The scope's own node first: a Theme leaf cannot hang off a parent that does not exist.
-    EnsureAreaPath $s.AreaPath $have
+    #
+    # Remapped, like every other path here. Without it this would recreate the pre-remap tree - the
+    # EDU node, and every Theme leaf that AreaPathRemap folds away - which is the opposite of the
+    # point: the target tree is fixed and the migration must not add to it.
+    EnsureAreaPath (RemapAreaPath $s.AreaPath) $have
 
     # Only Story and Defect carry a Theme, so only they can need a leaf. Epic, Task and Issue have
     # no Theme and land on the scope's own area path.
@@ -277,7 +288,10 @@ function CreateAreaPaths([switch]$DryRun)
         continue
       }
 
-      $path = if ($s.AreaPath) { "$($s.AreaPath)\$($leaf.Value)" } else { $leaf.Value }
+      # Same composition the migration does, then the same remap, so this ensures exactly the nodes
+      # the migration will write to and no others. A leaf the remap folds away resolves to its
+      # target (which already exists) or to the root (which EnsureAreaPath ignores).
+      $path = RemapAreaPath $(if ($s.AreaPath) { "$($s.AreaPath)\$($leaf.Value)" } else { $leaf.Value })
       EnsureAreaPath $path $have $themes[$theme]
     }
 
@@ -981,10 +995,15 @@ function GetSelection([string]$agilityType)
       # blocks, and .Number is what turns them into agility:<Number> tag lookups. Issues migrate
       # last, so everything they point at is already in ADO.
       #
+      # PrimaryWorkitems is a DIFFERENT and weaker relationship: "relates to", with no direction and
+      # no blocking semantics. Agility keeps the two apart and so do we - blocking becomes Affects,
+      # this becomes Related. 58 links across 42 Issues, every target a Story or a Defect.
+      #
       # Issue has NO Dependencies or Dependants attribute at all, so those are absent by necessity
       # rather than choice. Reference carries 2 values and rides in the description.
       return "$common,Owner.Name,Owner.Email,Category.Name,TargetDate,ClosedDate," +
-             "Resolution,ResolutionReason.Name,BlockedPrimaryWorkitems.Number,BlockedEpics.Number,Reference"
+             "Resolution,ResolutionReason.Name,BlockedPrimaryWorkitems.Number,BlockedEpics.Number," +
+             "PrimaryWorkitems.Number,Reference"
     }
     'Task'
     {
@@ -1101,6 +1120,12 @@ function ConvertFromAgilityAssets($response, [string]$agilityType = 'Epic')
     $blocked += @(GetAttributeValues $attributes "BlockedEpics.Number")
     $blockedNumbers = @($blocked | Where-Object { $_ })
 
+    # The work items this Issue merely RELATES TO. Agility keeps this apart from blocking and so do
+    # we: this one carries no direction and no blocking meaning, so it becomes a Related link rather
+    # than an Affects. Unlike the blocked pair there is no Epic-side attribute; every target in the
+    # instance is a Story or a Defect.
+    $associatedNumbers = @(@(GetAttributeValues $attributes "PrimaryWorkitems.Number") | Where-Object { $_ })
+
     # Issue has Owner (singular), every other type has Owners (multi value).
     #
     # Aligned, not filtered: these two lists are read off one relation and index i must mean the
@@ -1133,6 +1158,10 @@ function ConvertFromAgilityAssets($response, [string]$agilityType = 'Epic')
 
       # Issue only: the Agility numbers of the work items this Issue blocks.
       BlockedNumbers = $blockedNumbers
+
+      # Issue only: the Agility numbers of the work items this Issue relates to, which is the
+      # weaker association and becomes a Related link rather than an Affects.
+      AssociatedNumbers = $associatedNumbers
 
       AssetState  = GetAttributeValue $attributes "AssetState"
 
@@ -1612,6 +1641,44 @@ function ResolveBlockedIds($item, $existing)
   }
 }
 
+# The ADO ids for the work items an Issue merely RELATES TO, and the Agility numbers that had no ADO
+# item to point at. Same resolution rules as ResolveBlockedIds - straight off the Number, no
+# numberByOid hop, and Issues migrate last so the tag map already holds every target.
+#
+# $blockedIds is what makes this different. Two Issues in the instance both BLOCK and RELATE TO the
+# same work item, and writing both links would put an Affects and a Related between the same pair.
+# That is redundant rather than informative: Affects already says everything Related would, and more.
+# So the stronger link wins and the duplicate Related is dropped - silently, because nothing is lost
+# and it is not a miss to report.
+function ResolveAssociatedIds($item, $existing, $blockedIds)
+{
+  $ids = @()
+  $pending = @()
+  $unresolved = @()
+  $already = @($blockedIds)
+
+  foreach ($number in @($item.AssociatedNumbers))
+  {
+    if (-not $number) { continue }
+
+    if (-not $existing.ContainsKey($number)) { $unresolved += $number; continue }
+
+    # Pending is a dry run thing only, exactly as in ResolveBlockedIds: a real run would have
+    # created this item earlier in the same run, so reporting it as a miss understates the run.
+    if ($existing[$number] -eq $script:DryRunPendingId) { $pending += $number; continue }
+
+    if ($already -contains $existing[$number]) { continue }
+
+    $ids += $existing[$number]
+  }
+
+  return [pscustomobject]@{
+    Ids        = @($ids | Select-Object -Unique)
+    Pending    = @($pending | Select-Object -Unique)
+    Unresolved = @($unresolved | Select-Object -Unique)
+  }
+}
+
 # The ADO ids for the Epics this one depends on and the Epics that depend on it, plus the Agility
 # numbers that had no ADO item to point at.
 #
@@ -1634,6 +1701,61 @@ function RecordNumbersInRun($items)
   {
     if ($item.Number) { $script:numbersInRun["$($item.Number)"] = $true }
   }
+}
+
+# The same set, but for EVERY type in the run, read before any item migrates.
+#
+# The per-type fill above cannot see across type boundaries, and dependencies do: Story S-01831
+# depends on Defect D-01204, Defects migrate after Stories, so when the Story was written the
+# Defect had not been read. ResolveDependencyIds then reported a partner that was merely not
+# created YET as one outside the configured scopes, and the item kept an agility-depends tag for a
+# link that the Defect wrote from its own side moments later. 152 items on the 2026-08-05/06 run.
+#
+# A SEPARATE, cheap walk rather than reading everything up front: sel=Number only, and the numbers
+# are taken straight off the wire instead of through ConvertFromAgilityAssets, so nothing here
+# depends on a type's full selection being valid. Reading the real assets twice would double a 13
+# hour run; this adds one short pass.
+#
+# The Dead filter is NOT optional. Recording a Dead template's number would claim the run will
+# create it, which would suppress a warning that is actually correct.
+function RecordAllNumbersInRun([string[]]$agilityTypes, $scopes)
+{
+  if ($null -eq $script:numbersInRun) { $script:numbersInRun = @{} }
+
+  foreach ($agilityType in @($agilityTypes))
+  {
+    foreach ($s in @($scopes))
+    {
+      $where = "Scope='$($s.Scope)';AssetState!='Dead'"
+      $pageSize = 500
+      $start = 0
+
+      while ($true)
+      {
+        $url = "{0}/rest-1.v1/Data/{1}?sel=Number&where={2}&page={3},{4}" -f `
+          $script:config.Agility.BaseUrl.TrimEnd('/'),
+          $agilityType,
+          [uri]::EscapeDataString($where),
+          $pageSize,
+          $start
+
+        $assets = @((InvokeAgilityGet $url).Assets)
+        if ($assets.Count -eq 0) { break }
+
+        foreach ($a in $assets)
+        {
+          $number = GetAttributeValue $a.Attributes 'Number'
+          if ($number) { $script:numbersInRun["$number"] = $true }
+        }
+
+        if ($assets.Count -lt $pageSize) { break }
+        $start += $pageSize
+      }
+    }
+  }
+
+  WriteLog "Read $($script:numbersInRun.Count) Agility numbers across $(@($agilityTypes).Count) types, so a partner created later in this run is not reported missing"
+  WriteLog
 }
 
 function ResolveDependencyIds($item, $existing)
@@ -1759,6 +1881,17 @@ function MigrateItem($epic, $existing)
     $script:warnings++
   }
 
+  # Issue only, and resolved AFTER the blocked links because it needs their ids: an item this Issue
+  # both blocks and relates to gets the Affects link only, never both.
+  $associated = ResolveAssociatedIds $epic $existing $blocked.Ids
+  $epic | Add-Member -NotePropertyName AssociatedUnresolved -NotePropertyValue $associated.Unresolved -Force
+
+  if ($associated.Unresolved.Count -gt 0)
+  {
+    WriteLog "  WARN    $($epic.Number) relates to $($associated.Unresolved -join ', '), which are not in Azure DevOps, keeping them as tags" Yellow
+    $script:warnings++
+  }
+
   # Epic to Epic dependencies, same shape: resolved up front so the dry run and the real run agree.
   $dependencies = ResolveDependencyIds $epic $existing
   $epic | Add-Member -NotePropertyName DependencyUnresolved -NotePropertyValue $dependencies.Unresolved -Force
@@ -1788,6 +1921,11 @@ function MigrateItem($epic, $existing)
     if ($blocked.Ids.Count -gt 0)        { $blocksText += " affects->#$($blocked.Ids -join ',#')" }
     if ($blocked.Pending.Count -gt 0)    { $blocksText += " affects $($blocked.Pending -join ',') created earlier in this run" }
     if ($blocked.Unresolved.Count -gt 0) { $blocksText += " affects $($blocked.Unresolved -join ',') NOT IN ADO" }
+
+    # The weaker association, reported the same way and kept visibly distinct from affects.
+    if ($associated.Ids.Count -gt 0)        { $blocksText += " relates->#$($associated.Ids -join ',#')" }
+    if ($associated.Pending.Count -gt 0)    { $blocksText += " relates $($associated.Pending -join ',') created earlier in this run" }
+    if ($associated.Unresolved.Count -gt 0) { $blocksText += " relates $($associated.Unresolved -join ',') NOT IN ADO" }
 
     $titleText = BuildTitle $epic
     if (IsTitleTruncated $epic) { $titleText += " [TITLE TRUNCATED from $($epic.Name.Length) chars, full text kept in description]" }
@@ -1844,7 +1982,7 @@ function MigrateItem($epic, $existing)
     # Revision 1: the item, created backdated to its Agility creator and create date (inside
     # NewAdoWorkItem, under bypassRules). No System.AssignedTo here, so there is nothing for an
     # identity to reject: the create no longer needs the old unassigned retry.
-    $id = NewAdoWorkItem $epic $parentId $trueParentId $blocked.Ids
+    $id = NewAdoWorkItem $epic $parentId $trueParentId $blocked.Ids $associated.Ids
     $existing[$key] = $id
 
     # Dependency links, now that the item exists and a cyclic one can only cost itself.
@@ -2088,6 +2226,104 @@ function BuildOwnersField($item)
     if ($names[$i]) { $extras += $names[$i] }
   }
   return ($extras -join ', ')
+}
+
+# ORDERED rule matching, shared by the category map and the area path remap.
+#
+# Both were asked for in terms a flat name-to-name map cannot express: "everything EDU and below" is
+# a prefix, "any COVID" is a substring, and "Networking - COVID" is an exact exception that has to
+# beat that substring. So the rules are a LIST, evaluated in order, first match wins, and the
+# exception is written above the general case.
+#
+# The kind is spelled out per rule rather than inferred. CLAUDE.md's warning against prefix and
+# substring matching still stands for TEAM names, where a loose match silently mis-files; here the
+# looseness is the requirement, and it is contained by being explicit and ordered.
+#
+# An unrecognised kind THROWS. A matcher that quietly matches nothing looks exactly like one that
+# works, which is the same failure mode as a delete query losing its type clause.
+function MatchesValueRule($rule, [string]$value)
+{
+  $v = "$value".Trim()
+  $target = "$($rule.Value)"
+
+  switch ("$($rule.When)")
+  {
+    # IndexOf/StartsWith rather than -like, so a value containing [ or * cannot be read as a wildcard.
+    'Exact'    { return $v.Equals($target, [StringComparison]::OrdinalIgnoreCase) }
+    'Contains' { return ($v.IndexOf($target, [StringComparison]::OrdinalIgnoreCase) -ge 0) }
+
+    # "This node or below", never "starts with these letters": EDU must not swallow EDUCATION.
+    'Prefix'
+    {
+      if ($v.Equals($target, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+      return $v.StartsWith("$target\", [StringComparison]::OrdinalIgnoreCase)
+    }
+
+    default { throw "Unknown rule kind '$($rule.When)' in mappings.json. Use Exact, Prefix, or Contains." }
+  }
+}
+
+# The first matching rule's target, or $null when nothing matches. A rule may target an empty string
+# (the project root), which is why the caller has to test for $null rather than for emptiness.
+function ApplyValueRules($rules, [string]$value)
+{
+  foreach ($rule in @($rules))
+  {
+    if (MatchesValueRule $rule $value) { return "$($rule.To)" }
+  }
+
+  return $null
+}
+
+# The Agility Category collapsed onto the three values the ADO field is allowed to hold:
+# Operational, Operational Enhancement, External Request. Anything else maps to NOTHING on purpose -
+# the description note is the record for those, and an empty field keeps the write valid if the
+# field is ever locked down to a picklist of exactly those three.
+function MapCategoryValue([string]$raw)
+{
+  if (-not $raw) { return $null }
+  if (-not $script:mappings.PSObject.Properties['CategoryMap']) { return $null }
+
+  return ApplyValueRules $script:mappings.CategoryMap $raw
+}
+
+# What actually goes in the category field: the mapped value, or empty.
+#
+# Empty for anything heading to Removed, by request - a long finished item keeps the description
+# note and nothing else. Empty also for a value that does not map, so the field only ever holds one
+# of the three legal values.
+function ResolveCategoryField($epic)
+{
+  if (-not $epic.Category) { return "" }
+  if (IsStaleCategoryItem $epic) { return "" }
+
+  $mapped = MapCategoryValue $epic.Category
+  if ($mapped) { return $mapped }
+
+  return ""
+}
+
+# Whether this item is heading for its type's stale state.
+#
+# Deliberately tolerant of an item whose type has no state mapping: GetStateMap throws for one, and
+# the category must never be the thing that makes an otherwise good patch fail. A type with no state
+# map cannot be archived anyway, so "not stale" is the correct answer as well as the safe one.
+function IsStaleCategoryItem($epic)
+{
+  if (-not $script:mappings.PSObject.Properties['States']) { return $false }
+  if (-not $script:mappings.States.PSObject.Properties["$($epic.AgilityType)"]) { return $false }
+
+  return (IsStaleAdoState $epic (MapState $epic))
+}
+
+# The category note that closes the description. Written whenever Agility has a category, including
+# for Removed items and for values that do not map - for those it is the ONLY record, which is the
+# whole reason it exists.
+function BuildCategoryNote($epic)
+{
+  if (-not $epic.Category) { return "" }
+
+  return "<hr /><p><b>Digital.ai category:</b> " + [System.Net.WebUtility]::HtmlEncode($epic.Category) + "</p>"
 }
 
 # A raw Agility value mapped through a named value map in mappings.json. Trim, then CASE SENSITIVE
@@ -2349,8 +2585,11 @@ function BuildFieldPatch($epic)
   # status, they are written on every item, empty when Agility has no value, so the field always
   # means something and is queryable. FY only ever has a value on Epics and Features: Agility's
   # Custom_FiscalYear attribute exists on Epic alone, so every other type writes it empty.
-  $category = if ($epic.Category) { $epic.Category } else { "" }
-  $patch += @{ op = "add"; path = "/fields/$($script:mappings.RequiredFields.AgilityCategory)"; value = $category }
+  # The category is no longer the raw Agility value. It is collapsed onto the three the field
+  # accepts, is left EMPTY for anything heading to Removed, and is left empty for a value that does
+  # not map. BuildDescription carries the raw value as a note in every one of those cases, so the
+  # field can be narrow without losing anything.
+  $patch += @{ op = "add"; path = "/fields/$($script:mappings.RequiredFields.AgilityCategory)"; value = (ResolveCategoryField $epic) }
 
   # EVERY fiscal year, not just the first: 42 of 114 Epics carry more than one and 59 values were
   # being dropped. The field is free text (verified against the live field definition), so a joined
@@ -2516,7 +2755,32 @@ function BuildFieldPatch($epic)
   return $patch
 }
 
-function NewAdoWorkItem($epic, $parentId, $trueParentId, $blockedIds)
+# One /relations/- add op per id, all sharing a link type and a comment. Extracted so the relation
+# shape lives in one place and can be tested without a create: the two link kinds an Issue writes
+# differ only in the type and the wording.
+function BuildLinkOps([string]$rel, $ids, [string]$comment)
+{
+  $ops = @()
+
+  foreach ($id in @($ids))
+  {
+    if (-not $id) { continue }
+
+    $ops += @{
+      op    = "add"
+      path  = "/relations/-"
+      value = @{
+        rel        = $rel
+        url        = (AdoWorkItemUrl $id)
+        attributes = @{ comment = $comment }
+      }
+    }
+  }
+
+  return $ops
+}
+
+function NewAdoWorkItem($epic, $parentId, $trueParentId, $blockedIds, $associatedIds)
 {
   $patch = BuildFieldPatch $epic
 
@@ -2548,18 +2812,15 @@ function NewAdoWorkItem($epic, $parentId, $trueParentId, $blockedIds)
   # Not Parent/Child: a single Issue blocks up to 12 items, and hierarchy is a tree topology that
   # allows one parent, so it cannot represent this data at all. Affects is a dependency topology,
   # so it is directional and many to many, which is what the data needs.
-  foreach ($blockedId in @($blockedIds))
-  {
-    $patch += @{
-      op    = "add"
-      path  = "/relations/-"
-      value = @{
-        rel        = ($script:mappings.LinkTypes.Blocks)
-        url        = (AdoWorkItemUrl $blockedId)
-        attributes = @{ comment = "Blocked by Agility $($epic.Number)." }
-      }
-    }
-  }
+  $patch += BuildLinkOps ($script:mappings.LinkTypes.Blocks) $blockedIds "Blocked by Agility $($epic.Number)."
+
+  # Agility's weaker "relates to" (PrimaryWorkitems) becomes Related. The association carries no
+  # direction and no blocking meaning, so Affects would overstate it.
+  #
+  # Safe in the create, unlike the dependency links below: ADO enforces no acyclicity rule on
+  # Related, so there is no payload here it can reject the whole item over. ResolveAssociatedIds has
+  # already dropped any target the Affects links above cover, so no pair ever gets both.
+  $patch += BuildLinkOps ($script:mappings.LinkTypes.Related) $associatedIds "Related to Agility $($epic.Number)."
 
   # Dependency links are deliberately NOT here. Agility allows cycles in a dependency graph and ADO
   # does not, so a cyclic link inside this payload makes ADO reject the entire create with TF201035
@@ -3110,6 +3371,11 @@ function BuildDescription($epic, $themeInfo)
   # theme and resolution reason became Custom.DigitalAI* fields, and source became a tag again.
   $description += BuildAgilityDetails $epic
 
+  # The Agility category, last. It is written for EVERY item that has one, whether or not the value
+  # maps onto the three the field accepts, and whether or not the item is heading for Removed - for
+  # those two cases this note is the only record that survives.
+  $description += BuildCategoryNote $epic
+
   # No migration footer. Where the item came from is provenance, not content, so it goes to the
   # Discussion as a comment dated the day of the migration (see BuildMigrationNote). The description
   # therefore carries only the item's own material, and is empty when Agility had nothing to say.
@@ -3264,6 +3530,13 @@ function BuildTags($item)
     if ($number) { $tags += "agility-blocks:$number" }
   }
 
+  # And the weaker association, same rule: the Related link cannot be made to something outside the
+  # configured scopes, so the number is what is left of the relationship.
+  foreach ($number in @($item.AssociatedUnresolved))
+  {
+    if ($number) { $tags += "agility-relates:$number" }
+  }
+
   # An Epic dependency whose other end is outside the configured scopes: the link cannot be made, so
   # the number stays, same rule as the parent and the blocked items.
   foreach ($number in @($item.DependencyUnresolved))
@@ -3302,14 +3575,43 @@ function ResolveAreaPath([string]$scopeAreaPath, [string]$theme, [string]$team)
     if ($fromTeam) { $base = $fromTeam }
   }
 
-  if (-not $theme) { return $base }
+  $path = $base
+  if ($theme)
+  {
+    $leaf = $script:mappings.ThemeAreaPaths.PSObject.Properties[$theme]
+    if ($leaf)
+    {
+      $path = if ($base) { "$base\$($leaf.Value)" } else { "$($leaf.Value)" }
+    }
+  }
 
-  $leaf = $script:mappings.ThemeAreaPaths.PSObject.Properties[$theme]
-  if (-not $leaf) { return $base }
+  # One exit, so the remap cannot be skipped by a path that returned early.
+  return RemapAreaPath $path
+}
 
-  if (-not $base) { return $leaf.Value }
+# The composed scope-and-Theme path folded onto the fixed IT tree the migration targets:
+#
+#   Operations{Apps, DevOps, Networking, System}   User Services{AV, Help Desk, Technical Services Support}
+#
+# Applied AFTER composition rather than by rewriting ThemeAreaPaths, because the target depends on
+# the scope as well as the Theme: Colleague under Operations becomes Apps, but Colleague under EDU
+# goes to the root. A per-Theme map cannot express that; a rule over the composed path can.
+#
+# Rules live in mappings.json and are ORDERED - see MatchesValueRule. The order that matters:
+# "Operations\Networking - COVID" is an Exact rule ABOVE the Contains rule for COVID, or the generic
+# rule would send it to the root instead of to Networking.
+#
+# A path no rule matches is returned unchanged, so a Theme added later lands where it always would
+# have rather than silently at the root.
+function RemapAreaPath([string]$path)
+{
+  if (-not $script:mappings.PSObject.Properties['AreaPathRemap']) { return $path }
 
-  return "$base\$($leaf.Value)"
+  # $null means no rule matched. An empty string is a real target: the project root.
+  $mapped = ApplyValueRules $script:mappings.AreaPathRemap $path
+  if ($null -eq $mapped) { return $path }
+
+  return $mapped
 }
 
 # The area path a Team implies, or $null when the map has no entry for it.
