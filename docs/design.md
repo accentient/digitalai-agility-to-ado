@@ -22,6 +22,25 @@ dependency ends, and **0 dangling** out of 109,488 link targets checked. The 10 
 ends are 5 cyclic pairs ADO refuses (`TF201035`) - Agility permits cycles, ADO does not. Also
 verified: 43,353 `Removed`, 3,114 attachments with 0 failures.
 
+**The state distribution was measured separately (2026-08-11)**, because the run log records only the
+`Removed` total and never the per-type split. Reading all 53,683 items back: Epic 26 New / 1 In
+Progress / 315 Removed; Feature 66 / 8 / 461; PBI 343 New, 6 Approved, 37 In Progress, 1,062 Done,
+6,254 Removed; Bug 1 / 2 / 3 / 107 / 599; Task 1,911 To Do, 109 In Progress, 6,255 Done, 35,724
+Removed; Impediment 48 Open, 345 Closed. The Removed column sums to exactly 43,353 and the table to
+53,683, which is the check that the scan and the log agree. **0 Epics and 0 Features are `Done`** -
+the stale rule archived every portfolio item that finished, so an empty Done column is correct.
+**Only 2,561 items are live**, which is the number that matters to anyone opening a backlog.
+
+Field coverage from the same scan: `AssignedTo` 40,201, `ClosedBy` 30,331, `AcceptanceCriteria`
+6,574, and 32,345 items on a real iteration. Tag census: 2 `agility-depends`, 116 `agility-source`,
+2,286 Agility `TaggedWith`, and zero `agility-parent`, `agility-blocks` or `agility-relates`.
+
+Re-running such a scan has one trap worth writing down: **`$top` belongs on the WIQL query string,
+not in the JSON body**. Without it a flat `SELECT` over 53,683 rows fails outright with `VS402337`
+rather than truncating. Page on a `System.Id` watermark, then read fields with
+`POST _apis/wit/workitemsbatch` in batches of 200 and tally on the client - long-text fields such as
+`AcceptanceCriteria` come back that way but cannot be filtered in WIQL at all.
+
 This replaced a 53,705-item run (2026-08-04) and, before that, a 53,450-item run (2026-07-18). Four
 failure modes were found and fixed across them, each documented where its reasoning lives:
 `TF401320 Closed Date Required` (see [Close dates](#close-dates)), `TF401320 Closed By ReadOnly`

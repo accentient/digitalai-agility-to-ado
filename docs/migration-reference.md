@@ -90,6 +90,12 @@ from backlogs, boards, and default queries** - that is the point of archiving, b
 knowing before a run puts most of your items there. `-DryRun` prints `state=` per item and the
 summary counts how many would be removed, so check that number before writing.
 
+**"Most" is not an exaggeration.** On the instance this was built for, `StaleAfterDays = 365` put
+**81% of 53,683 items (43,353) into `Removed`**, leaving 2,561 visible on a backlog. Every portfolio
+item that had finished, finished over a year earlier, so **zero Epics and zero Features ended up
+`Done`** and their Done column reads as empty. That is the rule working, but tell whoever uses the
+project afterwards, or the first reaction is that the migration lost their work.
+
 ## Acceptance criteria are recovered from the description
 
 Agility has **no acceptance criteria attribute on any type** - people write them into the description
