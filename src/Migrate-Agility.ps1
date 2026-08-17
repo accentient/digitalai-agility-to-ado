@@ -107,6 +107,10 @@ function Migrate([switch]$DryRun, [string]$Scope, [string[]]$Types = @('Epic','S
   # item counts because a failed file does not fail its item.
   $script:attachmentsCopied = 0
   $script:attachmentsFailed = 0
+  # Discussion comments moved from Agility, and the ones that would not move. Counted apart from
+  # items for the same reason attachments are: a failed comment leaves a good work item.
+  $script:commentsCopied = 0
+  $script:commentsFailed = 0
   # Raw values a value map has never seen (id, type, map, raw). Not written to their field, recorded
   # here so a new Team or strategic theme surfaces in the summary instead of vanishing.
   $script:fieldWarnings = @()
@@ -182,6 +186,11 @@ function Migrate([switch]$DryRun, [string]$Scope, [string[]]$Types = @('Epic','S
   # its own side anyway - verified afterwards, 40 of 40 sampled had both the tag and the link.
   $script:numbersInRun = @{}
   RecordAllNumbersInRun $Types $scopes
+
+  # Every Agility conversation, read once. Before the type loop, because an item migrated before
+  # this ran would get no discussion at all, and because a comment can only be backdated while its
+  # item is being created - there is no second chance later.
+  GetAgilityDiscussions
 
   # Dependency order, not the caller's order. Epics first so Stories and Defects can parent to
   # them; Tasks after both, since a Task parents to a Story or a Defect; Issues last, because the
@@ -1937,7 +1946,11 @@ function MigrateItem($epic, $existing)
     $attachmentCount = @(@($epic.AttachmentOids) | Where-Object { $_ }).Count
     $attachmentText = if ($attachmentCount -gt 0) { " attachments=$attachmentCount" } else { "" }
 
-    WriteLog "  WOULD   $($epic.AdoType.PadRight(8)) $($epic.Number) $titleText [$parentText$relatedText$blocksText] area=$(FormatAreaPath $epic.AreaPath) state=$(MapState $epic) priority=$(MapPriority $epic.Priority)$assignee$attachmentText"
+    # Say how many comments a real run would add. Nothing is written to work this out.
+    $discussionCount = @(DiscussionFor $epic).Count
+    $discussionText = if ($discussionCount -gt 0) { " discussion=$discussionCount" } else { "" }
+
+    WriteLog "  WOULD   $($epic.AdoType.PadRight(8)) $($epic.Number) $titleText [$parentText$relatedText$blocksText] area=$(FormatAreaPath $epic.AreaPath) state=$(MapState $epic) priority=$(MapPriority $epic.Priority)$assignee$attachmentText$discussionText"
 
     # Ask ADO whether it would actually accept these fields. Nothing is persisted.
     $problem = ValidateAdoWorkItem $epic
@@ -1988,6 +2001,12 @@ function MigrateItem($epic, $existing)
     # Dependency links, now that the item exists and a cyclic one can only cost itself.
     AddAdoDependencyLinks $id $epic $dependencies
 
+    # The conversation, split around the state transition. ADO requires each revision to be dated
+    # later than the last, and the transition is backdated to ChangeDateUTC, so a comment older
+    # than the transition has to go in before it or ADO rejects it outright (VS402625).
+    $discussion = SplitDiscussionAtTransition (DiscussionFor $epic) $epic.ChangeDate
+    AddAdoDiscussion $id $epic $discussion.Before
+
     # Revision 2: the state transition, backdated and attributed to the last changer. Only when the
     # mapped state differs from the create-time default, so an item that never left its default state
     # gets no empty second revision.
@@ -1996,6 +2015,8 @@ function MigrateItem($epic, $existing)
     {
       SetAdoState $id $adoState $epic
     }
+
+    AddAdoDiscussion $id $epic $discussion.After
 
     # Revision 3: the assignee, rule checked so a departed identity is rejected here rather than
     # stored. On rejection the item stays unassigned, and the owner we could not assign is written
@@ -3229,6 +3250,46 @@ function NewAdoAttachment([string]$fileName, $bytes)
 }
 
 # Copies every attachment on an Agility item onto the ADO work item it became.
+# The migrated conversation, one bypassRules patch per comment.
+#
+# bypassRules is not optional here: it is what lets the comment carry its real date and its real
+# author, including an author who is no longer an org member. Verified live 2026-08-11 - the same
+# address a rule-checked assignee patch rejects is accepted here and comes back as the comment's
+# createdOnBehalfOf.
+#
+# Non fatal per comment, exactly like attachments: the work item exists by now, so a comment that
+# will not post must not undo it.
+function AddAdoDiscussion([int]$id, $epic, $comments)
+{
+  if ($script:DryRun) { return }
+
+  # Where-Object rather than a bare @(), because @($null) has a Count of 1 and would sail past the
+  # guard below into a patch built out of nothing. Second rail behind the filter in
+  # SplitDiscussionAtTransition; this is the function that spends the call.
+  $list = @($comments | Where-Object { $_ })
+  if ($list.Count -eq 0) { return }
+
+  $url = "{0}/_apis/wit/workitems/{1}?api-version=7.1&bypassRules=true" -f `
+    $script:config.AzureDevOps.OrganizationUrl.TrimEnd('/'), $id
+
+  foreach ($comment in $list)
+  {
+    try
+    {
+      InvokeAdoRequest $url "Patch" (BuildCommentPatch $comment $epic.CreateDate) "application/json-patch+json" | Out-Null
+      $script:commentsCopied++
+    }
+    catch
+    {
+      $who = if ($comment.AuthorName) { $comment.AuthorName } else { "an unknown author" }
+      WriteLog "  WARN    $($epic.Number) discussion comment from $who could not be added - $(ReadAdoError $_)" Yellow
+      WriteErrorDetail $_ "discussion comment on $($epic.Number) from $who"
+      $script:warnings++
+      $script:commentsFailed++
+    }
+  }
+}
+
 function AddAdoAttachments([int]$id, $epic)
 {
   # A dry run writes nothing, and there is no reason to spend the bandwidth downloading either.
@@ -3398,6 +3459,270 @@ function BuildMigrationNote($epic)
   }
 
   return $note
+}
+
+##################################################################################################
+# Agility discussions
+#
+# Agility keeps conversation in Expression assets: an author, a date, some text, and a Mentions
+# link to whatever the thread is about. They become ADO comments, backdated and attributed.
+#
+# The bodies are PLAIN TEXT - 14,933 of 15,228 measured on 2026-08-11 - and an ADO comment is
+# rendered as HTML. So the text must be escaped: a comment containing "a < b" would otherwise lose
+# everything from the < onwards, silently, with a perfectly successful HTTP 200 behind it.
+##################################################################################################
+
+function EscapeHtmlText([string]$text)
+{
+  if (-not $text) { return "" }
+
+  # Ampersand FIRST. Escaping it after the others would turn the & of "&lt;" into "&amp;lt;".
+  $escaped = $text.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+
+  # Agility stores real newlines. HTML collapses them, so without this every comment arrives as a
+  # single run-on paragraph. CRLF before LF, or a CRLF becomes two breaks.
+  $escaped = $escaped -replace "`r`n", "<br>"
+  $escaped = $escaped -replace "`n", "<br>"
+  $escaped = $escaped -replace "`r", "<br>"
+
+  return $escaped
+}
+
+# A human date for the body text, not the wire format. FormatDate is the wire one.
+function FormatCommentDate($value)
+{
+  if (-not $value) { return "an unknown date" }
+
+  try { return ([datetime]$value).ToString('d MMMM yyyy', [cultureinfo]::InvariantCulture) }
+  catch { return "an unknown date" }
+}
+
+# The header is always present, by decision on 2026-08-11. ADO stores the real author in
+# createdOnBehalfOf, but whether the Discussion tab renders it was never verified, and if it does
+# not then this line is the only record of who wrote the comment.
+function BuildCommentBody($comment)
+{
+  $author = if ($comment.AuthorName) { $comment.AuthorName } else { "An unknown author" }
+  $header = "<b>$(EscapeHtmlText $author)</b> wrote in Agility on $(FormatCommentDate $comment.AuthoredAt)"
+
+  # ADO comments are flat, so the InReplyTo relationship would be lost entirely without this line.
+  if ($comment.InReplyToAuthor)
+  {
+    $header += ", in reply to $(EscapeHtmlText $comment.InReplyToAuthor) ($(FormatCommentDate $comment.InReplyToAt))"
+  }
+
+  # ${header} rather than $header: a colon straight after a variable name is read as a scope
+  # qualifier and the string would come out empty.
+  return "$($header):<br><br>$(EscapeHtmlText $comment.Content)"
+}
+
+# Email first, then the display name. No assignability probe: these ride in a bypassRules patch,
+# which accepts an identity that is not an org member - verified live 2026-08-11 - so a departed
+# author is credited here even though the same person can never be an assignee.
+function ResolveCommentAuthor($comment)
+{
+  if ($comment.AuthorEmail) { return $comment.AuthorEmail }
+  if ($comment.AuthorName)  { return $comment.AuthorName }
+
+  return $null
+}
+
+# ADO refuses a revision dated earlier than the one before it (VS402625), so an expression written
+# before its own work item existed cannot go in at its real date. Clamped up to the create date
+# rather than sent undated, because an undated comment lands on migration day, which is further
+# from the truth. Two revisions may share a timestamp; that was verified.
+function ResolveCommentDate($comment, $createDate)
+{
+  $authored = FormatDate $comment.AuthoredAt
+  if (-not $authored) { return $null }
+
+  $created = FormatDate $createDate
+  if (-not $created) { return $authored }
+
+  if (([datetime]$authored) -lt ([datetime]$created)) { return $created }
+
+  return $authored
+}
+
+function BuildCommentPatch($comment, $createDate)
+{
+  $patch = @(
+    @{ op = "add"; path = "/fields/System.History"; value = (BuildCommentBody $comment) }
+  )
+
+  # An expression with no author keeps its text. Three of them exist, and the words are the point.
+  $author = ResolveCommentAuthor $comment
+  if ($author) { $patch += @{ op = "add"; path = "/fields/System.ChangedBy"; value = $author } }
+
+  $when = ResolveCommentDate $comment $createDate
+  if ($when) { $patch += @{ op = "add"; path = "/fields/System.ChangedDate"; value = $when } }
+
+  # The leading comma is load bearing. PowerShell unrolls a one element array on return, so a patch
+  # carrying only History came back as a bare Hashtable; InvokeAdoRequest serializes with
+  # -AsArray:($body -is [array]), which is then false, and ADO gets an object where JSON Patch
+  # requires an array - HTTP 400, "You must pass a valid patch document in the body of the request".
+  return ,$patch
+}
+
+# Pure, so the ordering rule can be tested without a work item. The caller applies Before, then
+# transitions the state, then applies After.
+function SplitDiscussionAtTransition($comments, $transitionDate)
+{
+  $before = @()
+  $after = @()
+  $cutoff = FormatDate $transitionDate
+
+  # The null filter is not defensive tidying. DiscussionFor returns @() for an item with no
+  # discussion and PowerShell collapses that to $null at the call boundary, so @($comments) is
+  # @($null) here - a ONE element array holding a null, the same trap as @($item.relations) on an
+  # item with no relations. Without this the caller posted a phantom comment for every item in the
+  # instance that has no discussion: 48,085 of them on the 2026-08-12 run.
+  foreach ($comment in @($comments))
+  {
+    if (-not $comment) { continue }
+    if (-not $cutoff) { $before += $comment; continue }
+
+    $when = FormatDate $comment.AuthoredAt
+
+    # A comment with no date goes first: it will be sent without a ChangedDate, so it must not
+    # land after a revision that is already backdated past it.
+    if (-not $when -or ([datetime]$when) -le ([datetime]$cutoff)) { $before += $comment }
+    else { $after += $comment }
+  }
+
+  return [pscustomobject]@{ Before = @($before); After = @($after) }
+}
+
+# One pass over every Expression in the instance, exactly like RecordAllNumbersInRun and for the
+# same reason: reading them per work item would be 53,000 extra round trips on a run that already
+# takes 14 hours. About 100 calls at this page size.
+#
+# Selection is by CONVERSATION. An expression's Mentions link names what the thread is about, and
+# it is set on the topic starter; replies carry no mention at all. Of 6,464 replies measured on
+# 2026-08-11, 39 repeat it. Keying off Mentions alone would migrate every question and no answer.
+function GetAgilityDiscussions()
+{
+  $script:discussionsByOid = @{}
+
+  $migratedTypes = @('Epic', 'Story', 'Defect', 'Task', 'Issue')
+  $selection = "Author.Name,Author.Email,AuthoredAt,Content,Mentions,InReplyTo,BelongsTo"
+  $pageSize = 500
+  $start = 0
+
+  $threadByConversation = @{}
+  $itemsByConversation = @{}
+  $commentByOid = @{}
+
+  while ($true)
+  {
+    $url = "{0}/rest-1.v1/Data/Expression?sel={1}&page={2},{3}" -f `
+      $script:config.Agility.BaseUrl.TrimEnd('/'),
+      [uri]::EscapeDataString($selection),
+      $pageSize,
+      $start
+
+    $assets = @((InvokeAgilityGet $url).Assets)
+    if ($assets.Count -eq 0) { break }
+
+    foreach ($asset in $assets)
+    {
+      $conversation = GetAttributeValue $asset.Attributes 'BelongsTo'
+      if (-not $conversation) { continue }
+
+      # NormalizeOid on the expression's own id AND on the InReplyTo it points at. An asset id can
+      # carry the moment as a third part while the relation idref does not, and an unnormalized
+      # pair never matches: the parent lookup below would miss and the reply marker would vanish
+      # with nothing in the log. Same class of silent mismatch as an unnormalized mention oid.
+      $comment = [pscustomobject]@{
+        Oid             = NormalizeOid $asset.id
+        AuthorName      = GetAttributeValue $asset.Attributes 'Author.Name'
+        AuthorEmail     = GetAttributeValue $asset.Attributes 'Author.Email'
+        AuthoredAt      = GetAttributeValue $asset.Attributes 'AuthoredAt'
+        Content         = GetAttributeValue $asset.Attributes 'Content'
+        InReplyToOid    = NormalizeOid (GetAttributeValue $asset.Attributes 'InReplyTo')
+        InReplyToAuthor = $null
+        InReplyToAt     = $null
+      }
+
+      $commentByOid[$comment.Oid] = $comment
+
+      if (-not $threadByConversation.ContainsKey($conversation)) { $threadByConversation[$conversation] = @() }
+      $threadByConversation[$conversation] += $comment
+
+      foreach ($mention in (GetAttributeValues $asset.Attributes 'Mentions'))
+      {
+        $idref = if ($mention -is [psobject] -and $mention.PSObject.Properties['idref']) { $mention.idref } else { "$mention" }
+
+        # NormalizeOid, because a mention can carry the moment as a third part while $epic.Oid is
+        # always Type:Id. Unnormalized keys match nothing and the lookup fails silently.
+        $oid = NormalizeOid $idref
+        if (-not $oid) { continue }
+        if (($oid -split ':')[0] -notin $migratedTypes) { continue }
+
+        if (-not $itemsByConversation.ContainsKey($conversation)) { $itemsByConversation[$conversation] = @{} }
+        $itemsByConversation[$conversation][$oid] = $true
+      }
+    }
+
+    if ($assets.Count -lt $pageSize) { break }
+    $start += $pageSize
+  }
+
+  # Reply parents are resolved only now, because a reply can be read before the expression it
+  # answers.
+  foreach ($comment in $commentByOid.Values)
+  {
+    if (-not $comment.InReplyToOid) { continue }
+
+    $parent = $commentByOid["$($comment.InReplyToOid)"]
+    if (-not $parent) { continue }
+
+    $comment.InReplyToAuthor = $parent.AuthorName
+    $comment.InReplyToAt     = $parent.AuthoredAt
+  }
+
+  # A work item can be talked about in more than one conversation, so this ACCUMULATES. It was a
+  # plain assignment until 2026-08-14, which meant the second conversation silently replaced the
+  # first while the counter below added both - the 2026-08-12 run reported 15,233 comments read and
+  # copied 9,993, and the missing 5,240 were the overwritten threads.
+  foreach ($conversation in $itemsByConversation.Keys)
+  {
+    $thread = @($threadByConversation[$conversation])
+
+    foreach ($oid in $itemsByConversation[$conversation].Keys)
+    {
+      if (-not $script:discussionsByOid.ContainsKey($oid)) { $script:discussionsByOid[$oid] = @() }
+      $script:discussionsByOid[$oid] += $thread
+    }
+  }
+
+  # Sorted once per item, after every conversation has contributed, so two merged threads interleave
+  # by date instead of arriving one whole thread after the other. It has to happen here rather than
+  # per conversation for exactly that reason. An undated expression sorts first, where it cannot be
+  # rejected for arriving out of order.
+  $comments = 0
+  foreach ($oid in @($script:discussionsByOid.Keys))
+  {
+    $script:discussionsByOid[$oid] = @($script:discussionsByOid[$oid] | Sort-Object {
+      if ($_.AuthoredAt) { [datetime]$_.AuthoredAt } else { [datetime]::MinValue }
+    })
+
+    $comments += $script:discussionsByOid[$oid].Count
+  }
+
+  WriteLog "Read $comments Agility discussion comments for $($script:discussionsByOid.Count) work items"
+  WriteLog
+}
+
+function DiscussionFor($epic)
+{
+  if (-not $script:discussionsByOid) { return @() }
+  if (-not $epic.Oid) { return @() }
+
+  $thread = $script:discussionsByOid["$($epic.Oid)"]
+  if (-not $thread) { return @() }
+
+  return @($thread)
 }
 
 ##################################################################################################
@@ -3731,7 +4056,10 @@ function AdoWorkItemUrl($id)
 # at all and 6 still say "In Progress". Mapping on Status alone would recreate 393 finished Epics
 # in Azure DevOps as active work.
 # States are per Agility type, because ADO states differ per work item type: Impediment only has
-# Open and Closed, while Epic, PBI, and Bug have New/Approved/In Progress/Done/Removed.
+# Open and Closed, an Epic has no ready-to-be-pulled state at all, and a Task's proposed state is
+# called To Do rather than New. The names themselves live in mappings.json and are never hard coded
+# here, because a customized process renames them: CWI's Product Backlog Item and Bug have a custom
+# Ready where stock Scrum has Approved. AssertStatesExist proves whatever is configured against ADO.
 function GetStateMap($item)
 {
   $spec = $script:mappings.States.PSObject.Properties[$item.AgilityType]
@@ -4103,6 +4431,13 @@ function WriteSummary
   {
     WriteLog "Files:    $script:attachmentsCopied copied$(if ($script:attachmentsFailed -gt 0) { ", $script:attachmentsFailed could not be copied" })" `
       $(if ($script:attachmentsFailed -gt 0) { 'Yellow' } else { $null })
+  }
+
+  # Comments are counted apart from items for the same reason files are: one that would not post
+  # leaves a warning and a perfectly good work item.
+  if ($script:commentsCopied -gt 0 -or $script:commentsFailed -gt 0)
+  {
+    WriteLog "Comments: $script:commentsCopied copied, $script:commentsFailed failed"
   }
 
   # Values a value map (Team, strategic theme) never had an entry for. Grouped by map and value so a

@@ -59,13 +59,12 @@ function Main
   #
   # Creating work items lives in Migrate-Agility.ps1, which is air gapped from this script.
 
-  # DeleteAllImpediments
+  DeleteAllImpediments
   DeleteAllTasks
   DeleteAllBugs
   DeleteAllProductBacklogItems
   DeleteAllFeatures
   DeleteAllEpics
-
 }
 
 ##################################################################################################

@@ -327,7 +327,7 @@ Describe "MapState" {
         }
         Story = [pscustomobject]@{
           DefaultState = "New"; ClosedState = "Done"
-          Map = [pscustomobject]@{ "In Progress" = "In Progress"; "Committed" = "Approved"; "Done" = "Done" }
+          Map = [pscustomobject]@{ "In Progress" = "In Progress"; "Committed" = "Ready"; "Done" = "Done" }
         }
         Issue = [pscustomobject]@{
           DefaultState = "Open"; ClosedState = "Closed"
@@ -371,8 +371,8 @@ Describe "MapState" {
     IsAgilityClosed ([pscustomobject]@{ AssetState = 200 }) | Should -BeFalse
   }
 
-  It "uses the per-type map: Story 'Committed' becomes Approved, which is not an Epic state" {
-    MapState ([pscustomobject]@{ AgilityType = "Story"; AssetState = 64; Status = "Committed" }) | Should -Be "Approved"
+  It "uses the per-type map: Story 'Committed' becomes Ready, which is not an Epic state" {
+    MapState ([pscustomobject]@{ AgilityType = "Story"; AssetState = 64; Status = "Committed" }) | Should -Be "Ready"
   }
 
   It "maps an Issue to Open/Closed, because Impediment has no other states" {
@@ -3327,9 +3327,12 @@ Describe "Area path remapping onto the fixed IT tree" {
 # of these sit on CLOSED items where ClosedState wins and Status is ignored - so the map matters for
 # the handful that are active, and as insurance for the rest.
 #
-# There is no "Ready" state on a Product Backlog Item or a Bug: ADO offers New, Approved, In
-# Progress, Done, Removed. Approved is Scrum's ready-to-be-pulled state, so "Ready" means Approved
-# here. AssertStatesExist proves every target against ADO before the first create.
+# The ready-to-be-pulled state is whatever the target PROCESS calls it, and it is config, not code.
+# Stock Scrum calls it Approved; CWI's process dropped Approved from Product Backlog Item and Bug
+# and added a custom Ready [Proposed] in its place (verified live 2026-08-11 against
+# workitemtypes/{type}/states), so mappings.json targets Ready and this fixture mirrors it.
+# AssertStatesExist proves every target against ADO before the first create, so a stale name here
+# kills the run on call one rather than mis-filing items.
 ##################################################################################################
 Describe "Kanban-style statuses map to real ADO states" {
 
@@ -3340,10 +3343,10 @@ Describe "Kanban-style statuses map to real ADO states" {
         Story = [pscustomobject]@{
           DefaultState = "New"; ClosedState = "Done"; StaleState = "Removed"
           Map = [pscustomobject]@{
-            "Not Started" = "New"; "Ready" = "Approved"; "Committed" = "Approved"
+            "Not Started" = "New"; "Ready" = "Ready"; "Committed" = "Ready"
             "In Progress" = "In Progress"; "On Hold" = "In Progress"
             "Done" = "Done"; "Completed" = "Done"; "Done Done" = "Done"
-            "Accepted" = "Approved"; "Future" = "New"
+            "Accepted" = "Ready"; "Future" = "New"
             "Systems" = "In Progress"; "Applications" = "In Progress"; "Network" = "In Progress"
             "Development" = "In Progress"; "On order" = "In Progress"; "On Deck" = "In Progress"
             "Training" = "In Progress"; "Vendor" = "In Progress"
@@ -3352,7 +3355,7 @@ Describe "Kanban-style statuses map to real ADO states" {
         Defect = [pscustomobject]@{
           DefaultState = "New"; ClosedState = "Done"; StaleState = "Removed"
           Map = [pscustomobject]@{
-            "Not Started" = "Approved"; "In Progress" = "In Progress"
+            "Not Started" = "Ready"; "In Progress" = "In Progress"
             "Applications" = "In Progress"; "Development" = "In Progress"; "Network" = "In Progress"
             "Done Done" = "Done"; "Completed" = "Done"; "Done" = "Done"
           }
@@ -3365,7 +3368,7 @@ Describe "Kanban-style statuses map to real ADO states" {
 
   It "maps every configured Product Backlog Item status" {
     $cases = @{
-      'Committed' = 'Approved'; 'Accepted' = 'Approved'; 'Future' = 'New'
+      'Committed' = 'Ready'; 'Accepted' = 'Ready'; 'Future' = 'New'
       'Systems' = 'In Progress'; 'Applications' = 'In Progress'; 'Network' = 'In Progress'
       'On Hold' = 'In Progress'; 'Development' = 'In Progress'; 'On order' = 'In Progress'
       'On Deck' = 'In Progress'; 'Training' = 'In Progress'; 'Vendor' = 'In Progress'
@@ -3381,7 +3384,7 @@ Describe "Kanban-style statuses map to real ADO states" {
 
   It "maps every configured Bug status" {
     $cases = @{
-      'Not Started' = 'Approved'; 'Applications' = 'In Progress'
+      'Not Started' = 'Ready'; 'Applications' = 'In Progress'
       'Development' = 'In Progress'; 'Network' = 'In Progress'
     }
 
@@ -3394,7 +3397,7 @@ Describe "Kanban-style statuses map to real ADO states" {
 
   # Every target has to be a state the type actually has, or the run dies at AssertStatesExist.
   It "never maps to a state Product Backlog Item and Bug do not have" {
-    $real = @('New', 'Approved', 'In Progress', 'Done', 'Removed')
+    $real = @('New', 'Ready', 'In Progress', 'Done', 'Removed')
 
     foreach ($type in @('Story', 'Defect'))
     {
@@ -5227,3 +5230,506 @@ Describe "MaterializeOwners: add recoverable owners to the org as free Stakehold
   }
 }
 
+
+##################################################################################################
+# Agility discussions become ADO comments. The escaping is the part that fails silently: Agility
+# stores these as plain text (14,933 of 15,228 measured), ADO renders them as HTML, so an
+# unescaped < or & is a mangled or truncated comment that no counter would ever report.
+##################################################################################################
+Describe "BuildCommentBody" {
+
+  It "escapes HTML so plain text survives intact" {
+    $c = [pscustomobject]@{
+      AuthorName = "Sara Matson"; AuthoredAt = "2019-03-04T16:12:00"
+      Content = "Use a < b & c > d in the filter"; InReplyToAuthor = $null; InReplyToAt = $null
+    }
+
+    $body = BuildCommentBody $c
+    $body | Should -BeLike "*Use a &lt; b &amp; c &gt; d in the filter*"
+  }
+
+  It "escapes the ampersand first, so an escaped entity is not double escaped" {
+    EscapeHtmlText "a < b" | Should -Be "a &lt; b"
+    EscapeHtmlText "Tom & Jerry" | Should -Be "Tom &amp; Jerry"
+    EscapeHtmlText "&lt;" | Should -Be "&amp;lt;"
+  }
+
+  It "converts newlines to breaks, or the comment arrives as one run-on paragraph" {
+    EscapeHtmlText "one`r`ntwo`nthree" | Should -Be "one<br>two<br>three"
+  }
+
+  It "carries an attribution header with the Agility author and date" {
+    $c = [pscustomobject]@{
+      AuthorName = "Brittney Trimmer"; AuthoredAt = "2019-03-04T16:12:00"
+      Content = "Input please."; InReplyToAuthor = $null; InReplyToAt = $null
+    }
+
+    BuildCommentBody $c | Should -BeLike "*<b>Brittney Trimmer</b> wrote in Agility on 4 March 2019:*"
+  }
+
+  It "adds a reply marker naming the parent author and date" {
+    $c = [pscustomobject]@{
+      AuthorName = "Shannon Grimsley"; AuthoredAt = "2019-03-05T14:40:00"
+      Content = "Test the credit card case."
+      InReplyToAuthor = "Brittney Trimmer"; InReplyToAt = "2019-03-04T16:12:00"
+    }
+
+    BuildCommentBody $c | Should -BeLike "*in reply to Brittney Trimmer (4 March 2019):*"
+  }
+
+  It "omits the reply marker on a topic starter" {
+    $c = [pscustomobject]@{
+      AuthorName = "Sara Matson"; AuthoredAt = "2019-03-04T16:12:00"
+      Content = "Kicking this off."; InReplyToAuthor = $null; InReplyToAt = $null
+    }
+
+    BuildCommentBody $c | Should -Not -BeLike "*in reply to*"
+  }
+
+  It "escapes the author name too, since it also lands in HTML" {
+    $c = [pscustomobject]@{
+      AuthorName = "Ben & Co <IT>"; AuthoredAt = "2019-03-04T16:12:00"
+      Content = "x"; InReplyToAuthor = $null; InReplyToAt = $null
+    }
+
+    BuildCommentBody $c | Should -BeLike "*Ben &amp; Co &lt;IT&gt;*"
+  }
+
+  It "still produces a body when the author is missing, because 3 expressions have none" {
+    $c = [pscustomobject]@{
+      AuthorName = $null; AuthoredAt = "2019-03-04T16:12:00"
+      Content = "Orphaned comment."; InReplyToAuthor = $null; InReplyToAt = $null
+    }
+
+    BuildCommentBody $c | Should -BeLike "*Orphaned comment.*"
+  }
+}
+
+Describe "BuildCommentPatch" {
+
+  BeforeAll {
+    $script:plainComment = [pscustomobject]@{
+      AuthorName = "Sara Matson"; AuthorEmail = "sara.matson@cwi.edu"
+      AuthoredAt = "2019-03-04T16:12:00"; Content = "Hello"
+      InReplyToAuthor = $null; InReplyToAt = $null
+    }
+  }
+
+  It "prefers the author email, because that is what ADO resolves an identity from" {
+    ResolveCommentAuthor $script:plainComment | Should -Be "sara.matson@cwi.edu"
+  }
+
+  It "falls back to the display name when there is no email" {
+    $c = [pscustomobject]@{ AuthorName = "Vendor"; AuthorEmail = $null }
+    ResolveCommentAuthor $c | Should -Be "Vendor"
+  }
+
+  It "returns null when there is no author at all" {
+    ResolveCommentAuthor ([pscustomobject]@{ AuthorName = $null; AuthorEmail = $null }) | Should -BeNullOrEmpty
+  }
+
+  It "sends History, ChangedBy and ChangedDate" {
+    $patch = BuildCommentPatch $script:plainComment $null
+    $paths = @($patch | ForEach-Object { $_.path })
+
+    $paths | Should -Contain "/fields/System.History"
+    $paths | Should -Contain "/fields/System.ChangedBy"
+    $paths | Should -Contain "/fields/System.ChangedDate"
+  }
+
+  It "omits ChangedBy for an author-less comment rather than dropping the comment" {
+    $c = [pscustomobject]@{
+      AuthorName = $null; AuthorEmail = $null; AuthoredAt = "2019-03-04T16:12:00"
+      Content = "Orphaned"; InReplyToAuthor = $null; InReplyToAt = $null
+    }
+
+    $patch = BuildCommentPatch $c $null
+    @($patch | ForEach-Object { $_.path }) | Should -Not -Contain "/fields/System.ChangedBy"
+    @($patch | ForEach-Object { $_.path }) | Should -Contain "/fields/System.History"
+  }
+
+  # PowerShell unrolls a one element array on return, so a patch carrying only History came back as
+  # a bare Hashtable. InvokeAdoRequest serializes with -AsArray:($body -is [array]), which is then
+  # false, and ADO gets an object where JSON Patch requires an array: HTTP 400 "You must pass a
+  # valid patch document in the body of the request". Assert the TYPE, because the ops are all
+  # present and correct - only the shape of the container is wrong.
+  It "returns an array even when the patch holds a single op, or ADO rejects the document" {
+    $c = [pscustomobject]@{
+      AuthorName = $null; AuthorEmail = $null; AuthoredAt = $null
+      Content = "Orphaned"; InReplyToAuthor = $null; InReplyToAt = $null
+    }
+
+    $patch = BuildCommentPatch $c $null
+
+    @($patch).Count       | Should -Be 1
+    $patch -is [array]    | Should -BeTrue
+  }
+
+  # ADO rejects a revision dated before the previous one (VS402625). An expression older than the
+  # item itself would therefore be refused outright, so the date is clamped up rather than lost.
+  It "clamps a comment older than the item's create date up to the create date" {
+    $old = [pscustomobject]@{
+      AuthorName = "Sara Matson"; AuthorEmail = "sara.matson@cwi.edu"
+      AuthoredAt = "2015-01-01T00:00:00"; Content = "Ancient"
+      InReplyToAuthor = $null; InReplyToAt = $null
+    }
+
+    $patch = BuildCommentPatch $old "2019-02-01T17:00:00"
+    $when = ($patch | Where-Object { $_.path -eq "/fields/System.ChangedDate" }).value
+
+    $when | Should -Be (FormatDate "2019-02-01T17:00:00")
+  }
+
+  It "leaves a comment newer than the create date alone" {
+    $patch = BuildCommentPatch $script:plainComment "2019-02-01T17:00:00"
+    $when = ($patch | Where-Object { $_.path -eq "/fields/System.ChangedDate" }).value
+
+    $when | Should -Be (FormatDate "2019-03-04T16:12:00")
+  }
+}
+
+##################################################################################################
+# The migration writes rev 1 at CreateDate and the state transition at ChangeDateUTC. ADO requires
+# each revision to be dated later than the last, so a comment older than the transition MUST be
+# applied before it. This is the only reason MigrateItem's ordering changed.
+##################################################################################################
+Describe "SplitDiscussionAtTransition" {
+
+  BeforeAll {
+    $script:thread = @(
+      [pscustomobject]@{ Content = "one";   AuthoredAt = "2019-03-04T16:12:00" }
+      [pscustomobject]@{ Content = "two";   AuthoredAt = "2020-05-05T18:30:00" }
+      [pscustomobject]@{ Content = "three"; AuthoredAt = "2023-01-09T09:00:00" }
+    )
+  }
+
+  It "puts comments at or before the transition first and the rest after" {
+    $split = SplitDiscussionAtTransition $script:thread "2020-06-01T00:00:00"
+
+    @($split.Before | ForEach-Object { $_.Content }) | Should -Be @("one", "two")
+    @($split.After  | ForEach-Object { $_.Content }) | Should -Be @("three")
+  }
+
+  It "treats a comment exactly on the transition date as before it" {
+    $split = SplitDiscussionAtTransition $script:thread "2020-05-05T18:30:00"
+
+    @($split.Before | ForEach-Object { $_.Content }) | Should -Be @("one", "two")
+  }
+
+  It "returns everything in one group when there is no transition" {
+    $split = SplitDiscussionAtTransition $script:thread $null
+
+    @($split.Before).Count | Should -Be 3
+    @($split.After).Count  | Should -Be 0
+  }
+
+  It "returns two empty groups for an empty thread" {
+    $split = SplitDiscussionAtTransition @() "2020-06-01T00:00:00"
+
+    @($split.Before).Count | Should -Be 0
+    @($split.After).Count  | Should -Be 0
+  }
+
+  # DiscussionFor returns @() for an item with no discussion, and PowerShell collapses an empty
+  # array to $null at the call boundary, so this is what an item with no comments actually passes
+  # in. @($null) is a ONE element array holding $null - the same trap as @($item.relations) on an
+  # item with no relations - so without a null filter the caller posts a phantom comment for every
+  # item in the instance that has no discussion. It did: 48,085 of them on the 2026-08-12 run.
+  It "returns two empty groups when the thread is null, not one group holding a null" {
+    $split = SplitDiscussionAtTransition $null "2020-06-01T00:00:00"
+
+    @($split.Before).Count | Should -Be 0
+    @($split.After).Count  | Should -Be 0
+  }
+
+  It "puts a comment with no date first, where it cannot be rejected for being out of order" {
+    $split = SplitDiscussionAtTransition @([pscustomobject]@{ Content = "x"; AuthoredAt = $null }) "2020-06-01T00:00:00"
+
+    @($split.Before).Count | Should -Be 1
+  }
+}
+
+##################################################################################################
+# Selection is by CONVERSATION, not by the mention on the individual expression. Measured
+# 2026-08-11: 8,522 expressions mention a work item and they are almost all topic starters, while
+# the full threads hold 14,952. Of the 6,430 that carry no mention, 6,425 are replies. Selecting on
+# Mentions alone would migrate every question and 39 of 6,464 answers, and look completely clean.
+##################################################################################################
+Describe "GetAgilityDiscussions" {
+
+  BeforeAll {
+    function NewExpression([string]$id, [string]$conversation, [string]$author, [string]$at,
+                           [string]$content, [string]$replyTo, [string[]]$mentions)
+    {
+      $attributes = [pscustomobject]@{}
+      Add-Member -InputObject $attributes -NotePropertyName 'Author.Name'  -NotePropertyValue ([pscustomobject]@{ value = $author })
+      Add-Member -InputObject $attributes -NotePropertyName 'Author.Email' -NotePropertyValue ([pscustomobject]@{ value = "$author@cwi.edu" })
+      Add-Member -InputObject $attributes -NotePropertyName 'AuthoredAt'   -NotePropertyValue ([pscustomobject]@{ value = $at })
+      Add-Member -InputObject $attributes -NotePropertyName 'Content'      -NotePropertyValue ([pscustomobject]@{ value = $content })
+      Add-Member -InputObject $attributes -NotePropertyName 'BelongsTo'    -NotePropertyValue ([pscustomobject]@{ value = [pscustomobject]@{ idref = $conversation } })
+      Add-Member -InputObject $attributes -NotePropertyName 'InReplyTo'    -NotePropertyValue ([pscustomobject]@{ value = $(if ($replyTo) { [pscustomobject]@{ idref = $replyTo } } else { $null }) })
+      Add-Member -InputObject $attributes -NotePropertyName 'Mentions'     -NotePropertyValue ([pscustomobject]@{ value = @($mentions | ForEach-Object { [pscustomobject]@{ idref = $_ } }) })
+
+      return [pscustomobject]@{ id = $id; Attributes = $attributes }
+    }
+  }
+
+  BeforeEach {
+    $script:config = [pscustomobject]@{ Agility = [pscustomobject]@{ BaseUrl = "https://example.invalid/CWI" } }
+    $script:discussionsByOid = @{}
+  }
+
+  It "gives a work item the WHOLE thread, including replies that carry no mention" {
+    Mock InvokeAgilityGet {
+      [pscustomobject]@{ Assets = @(
+        (NewExpression "Expression:1" "Conversation:9" "Sara"    "2019-03-04T16:12:00" "Question" $null       @("Story:12345"))
+        (NewExpression "Expression:2" "Conversation:9" "Shannon" "2019-03-05T14:40:00" "Answer"   "Expression:1" @("Member:1013"))
+      ) }
+    }
+
+    GetAgilityDiscussions
+
+    $thread = $script:discussionsByOid["Story:12345"]
+    @($thread).Count | Should -Be 2
+    @($thread | ForEach-Object { $_.Content }) | Should -Be @("Question", "Answer")
+  }
+
+  It "resolves the reply's parent author and date, for the reply marker" {
+    Mock InvokeAgilityGet {
+      [pscustomobject]@{ Assets = @(
+        (NewExpression "Expression:1" "Conversation:9" "Sara"    "2019-03-04T16:12:00" "Question" $null          @("Story:12345"))
+        (NewExpression "Expression:2" "Conversation:9" "Shannon" "2019-03-05T14:40:00" "Answer"   "Expression:1" @())
+      ) }
+    }
+
+    GetAgilityDiscussions
+
+    $reply = $script:discussionsByOid["Story:12345"] | Where-Object { $_.Content -eq "Answer" }
+    $reply.InReplyToAuthor | Should -Be "Sara"
+    $reply.InReplyToAt     | Should -Be "2019-03-04T16:12:00"
+  }
+
+  It "sorts the thread by AuthoredAt, whatever order the wire returned it in" {
+    Mock InvokeAgilityGet {
+      [pscustomobject]@{ Assets = @(
+        (NewExpression "Expression:2" "Conversation:9" "Shannon" "2020-05-05T18:30:00" "second" $null @())
+        (NewExpression "Expression:1" "Conversation:9" "Sara"    "2019-03-04T16:12:00" "first"  $null @("Story:12345"))
+      ) }
+    }
+
+    GetAgilityDiscussions
+
+    @($script:discussionsByOid["Story:12345"] | ForEach-Object { $_.Content }) | Should -Be @("first", "second")
+  }
+
+  It "posts a thread to every work item its conversation mentions" {
+    Mock InvokeAgilityGet {
+      [pscustomobject]@{ Assets = @(
+        (NewExpression "Expression:1" "Conversation:9" "Sara" "2019-03-04T16:12:00" "Shared" $null @("Story:12345", "Defect:777"))
+      ) }
+    }
+
+    GetAgilityDiscussions
+
+    @($script:discussionsByOid["Story:12345"]).Count | Should -Be 1
+    @($script:discussionsByOid["Defect:777"]).Count  | Should -Be 1
+  }
+
+  # The reverse of the case above: one work item talked about in TWO conversations. This was a plain
+  # assignment into the map until 2026-08-14, so the second conversation silently replaced the
+  # first while the counter added both - which is why the 2026-08-12 run reported 15,233 comments
+  # read and copied only 9,993.
+  It "merges every conversation that mentions the same work item, in date order across both" {
+    Mock InvokeAgilityGet {
+      [pscustomobject]@{ Assets = @(
+        (NewExpression "Expression:1" "Conversation:9"  "Sara"    "2019-03-04T16:12:00" "first"  $null @("Story:12345"))
+        (NewExpression "Expression:2" "Conversation:10" "Shannon" "2020-05-05T18:30:00" "second" $null @("Story:12345"))
+      ) }
+    }
+
+    GetAgilityDiscussions
+
+    @($script:discussionsByOid["Story:12345"] | ForEach-Object { $_.Content }) | Should -Be @("first", "second")
+  }
+
+  # $epic.Oid is normalized to Type:Id, but a mention idref can carry the moment as a third part.
+  # Without NormalizeOid the keys never match and every lookup silently returns nothing - the same
+  # shape of bug as the Int64/Int32 mismatch that made every relation read as dangling.
+  It "normalizes a mention oid that carries a moment suffix" {
+    Mock InvokeAgilityGet {
+      [pscustomobject]@{ Assets = @(
+        (NewExpression "Expression:1" "Conversation:9" "Sara" "2019-03-04T16:12:00" "Hi" $null @("Story:12345:6789"))
+      ) }
+    }
+
+    GetAgilityDiscussions
+
+    $script:discussionsByOid.ContainsKey("Story:12345") | Should -BeTrue
+  }
+
+  # Same trap on the reply chain: an expression id can carry a moment while the InReplyTo idref
+  # does not. Unnormalized, the parent lookup misses and the reply marker vanishes with nothing in
+  # the log to say so.
+  It "resolves the reply parent even when the expression id carries a moment suffix" {
+    Mock InvokeAgilityGet {
+      [pscustomobject]@{ Assets = @(
+        (NewExpression "Expression:1:55" "Conversation:9" "Sara"    "2019-03-04T16:12:00" "Question" $null          @("Story:12345"))
+        (NewExpression "Expression:2"    "Conversation:9" "Shannon" "2019-03-05T14:40:00" "Answer"   "Expression:1" @())
+      ) }
+    }
+
+    GetAgilityDiscussions
+
+    $reply = $script:discussionsByOid["Story:12345"] | Where-Object { $_.Content -eq "Answer" }
+    $reply.InReplyToAuthor | Should -Be "Sara"
+  }
+
+  It "ignores a conversation that mentions nothing we migrate, which is how sample data stays out" {
+    Mock InvokeAgilityGet {
+      [pscustomobject]@{ Assets = @(
+        (NewExpression "Expression:1" "Conversation:9" "Sample: Andre Agile" "2015-01-01T00:00:00" "Demo" $null @("Member:1013"))
+      ) }
+    }
+
+    GetAgilityDiscussions
+
+    $script:discussionsByOid.Count | Should -Be 0
+  }
+
+  It "returns an empty list for an item with no discussion" {
+    $script:discussionsByOid = @{}
+    @(DiscussionFor ([pscustomobject]@{ Oid = "Story:99999" })).Count | Should -Be 0
+  }
+}
+
+Describe "AddAdoDiscussion" {
+
+  BeforeAll {
+    $script:epicWithThread = [pscustomobject]@{
+      Number = "S-12345"; Oid = "Story:12345"; CreateDate = "2019-02-01T17:00:00"
+    }
+    $script:twoComments = @(
+      [pscustomobject]@{ AuthorName = "Sara"; AuthorEmail = "sara@cwi.edu"; AuthoredAt = "2019-03-04T16:12:00"; Content = "one"; InReplyToAuthor = $null; InReplyToAt = $null }
+      [pscustomobject]@{ AuthorName = "Ann";  AuthorEmail = "ann@cwi.edu";  AuthoredAt = "2019-03-05T16:12:00"; Content = "two"; InReplyToAuthor = $null; InReplyToAt = $null }
+    )
+  }
+
+  BeforeEach {
+    $script:DryRun = $false
+    $script:warnings = 0
+    $script:commentsCopied = 0
+    $script:commentsFailed = 0
+    $script:config = [pscustomobject]@{ AzureDevOps = [pscustomobject]@{ OrganizationUrl = "https://dev.azure.com/org" } }
+    Mock WriteLog {}
+    Mock WriteErrorDetail {}
+  }
+
+  It "sends one patch per comment" {
+    Mock InvokeAdoRequest {}
+
+    AddAdoDiscussion 42 $script:epicWithThread $script:twoComments
+
+    Should -Invoke InvokeAdoRequest -Times 2 -Exactly
+    $script:commentsCopied | Should -Be 2
+  }
+
+  # bypassRules is what allows the backdating AND the departed author. Without it ADO stamps the
+  # comment with the migration account and the moment of the run, which is the whole point lost.
+  It "sends bypassRules on every comment patch" {
+    Mock InvokeAdoRequest { $script:seenUrl = $url }
+
+    AddAdoDiscussion 42 $script:epicWithThread @($script:twoComments[0])
+
+    $script:seenUrl | Should -BeLike "*bypassRules=true*"
+  }
+
+  It "writes nothing on a dry run" {
+    $script:DryRun = $true
+    Mock InvokeAdoRequest {}
+
+    AddAdoDiscussion 42 $script:epicWithThread $script:twoComments
+
+    Should -Invoke InvokeAdoRequest -Times 0 -Exactly
+  }
+
+  It "does nothing for an item with no comments" {
+    Mock InvokeAdoRequest {}
+
+    AddAdoDiscussion 42 $script:epicWithThread @()
+
+    Should -Invoke InvokeAdoRequest -Times 0 -Exactly
+  }
+
+  # The Count -eq 0 guard cannot catch @($null): it is a one element array, so the loop runs once
+  # on a null comment and posts a patch built out of nothing. Second rail behind the null filter in
+  # SplitDiscussionAtTransition, because this is the function that spends the call.
+  It "skips a null comment rather than posting a patch built from nothing" {
+    Mock InvokeAdoRequest {}
+
+    AddAdoDiscussion 42 $script:epicWithThread @($null)
+
+    Should -Invoke InvokeAdoRequest -Times 0 -Exactly
+    $script:commentsFailed | Should -Be 0
+  }
+
+  # The item already exists by the time comments are written, so a comment that will not post must
+  # warn and move on rather than undo a perfectly good work item. Same rule as attachments.
+  It "warns and continues when one comment fails, and still posts the rest" {
+    $script:calls = 0
+    Mock InvokeAdoRequest {
+      $script:calls++
+      if ($script:calls -eq 1) { throw "boom" }
+    }
+
+    { AddAdoDiscussion 42 $script:epicWithThread $script:twoComments } | Should -Not -Throw
+
+    $script:commentsFailed | Should -Be 1
+    $script:commentsCopied | Should -Be 1
+    $script:warnings       | Should -Be 1
+  }
+}
+
+Describe "Discussions are wired into the run" {
+
+  BeforeAll {
+    $script:source = Get-Content (Join-Path $PSScriptRoot ".." "src" "Migrate-Agility.ps1") -Raw
+    $script:code = ($script:source -split "`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+  }
+
+  # Same rule as RecordAllNumbersInRun: it must run before the type loop, or every item migrates
+  # before its discussion has been read and the feature does nothing at all.
+  It "reads discussions before the first item is migrated" {
+    $read = $script:code.IndexOf("GetAgilityDiscussions")
+    $loop = $script:code.IndexOf("MigrateEpics")
+
+    $read | Should -BeGreaterThan 0
+    $read | Should -BeLessThan $loop
+  }
+
+  # The transition is backdated to ChangeDateUTC, so a comment older than it can only go in before.
+  It "applies the pre-transition comments before SetAdoState and the rest after" {
+    $before = $script:code.IndexOf("AddAdoDiscussion `$id `$epic `$discussion.Before")
+    $state  = $script:code.IndexOf("SetAdoState `$id `$adoState `$epic")
+    $after  = $script:code.IndexOf("AddAdoDiscussion `$id `$epic `$discussion.After")
+
+    $before | Should -BeGreaterThan 0
+    $before | Should -BeLessThan $state
+    $after  | Should -BeGreaterThan $state
+  }
+
+  It "reads Expressions through InvokeAgilityGet, never a raw Invoke-RestMethod" {
+    $script:code | Should -Not -Match 'Invoke-RestMethod[^\n]*Expression'
+  }
+
+  It "never sends a write verb to the Expression endpoint" {
+    foreach ($verb in @('Post', 'Put', 'Patch', 'Delete'))
+    {
+      $script:code | Should -Not -Match "$verb[^\n]*rest-1\.v1/Data/Expression"
+    }
+  }
+
+  It "reports the comment counters in the summary" {
+    $script:code | Should -Match 'commentsCopied'
+    $script:code | Should -Match 'commentsFailed'
+  }
+}
