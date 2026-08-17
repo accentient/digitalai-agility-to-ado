@@ -45,7 +45,10 @@ rationale and the field audits.
 
 Field, state, and value-map configuration lives in `mappings.json` and can be customized without
 editing the script. States are keyed per type, because ADO's states are per type (an Impediment has
-no `Done`; an Epic has no `Approved`).
+no `Done`; an Epic has no ready-to-be-pulled state at all). The state **names** are configuration
+too - a customized process may call the ready state `Approved`, `Ready`, or anything else, so put
+whatever your process uses in `States.<Type>`; `AssertStatesExist` checks every one against ADO
+before the first work item is created.
 
 ## Why nested Epics become Features
 
