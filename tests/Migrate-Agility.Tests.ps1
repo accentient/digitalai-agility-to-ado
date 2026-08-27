@@ -323,7 +323,7 @@ Describe "MapState" {
       States = [pscustomobject]@{
         Epic  = [pscustomobject]@{
           DefaultState = "New"; ClosedState = "Done"
-          Map = [pscustomobject]@{ "In Progress" = "In Progress"; "Done" = "Done"; "Ready" = "New" }
+          Map = [pscustomobject]@{ "In Progress" = "In Progress"; "Done" = "Done"; "Ready" = "Ready" }
         }
         Story = [pscustomobject]@{
           DefaultState = "New"; ClosedState = "Done"
@@ -339,6 +339,10 @@ Describe "MapState" {
 
   It "maps an active Epic by its Status" {
     MapState ([pscustomobject]@{ AgilityType = "Epic"; AssetState = 64; Status = "In Progress" }) | Should -Be "In Progress"
+  }
+
+  It "maps an active Epic 'Ready' to the Ready state the user added to Epic and Feature" {
+    MapState ([pscustomobject]@{ AgilityType = "Epic"; AssetState = 64; Status = "Ready" }) | Should -Be "Ready"
   }
 
   It "falls back to the default state for an active Epic with no Status" {
@@ -357,6 +361,10 @@ Describe "MapState" {
   }
 
   It "maps a CLOSED Epic to Done even when its Status is unmapped" {
+    MapState ([pscustomobject]@{ AgilityType = "Epic"; AssetState = 128; Status = "Committed" }) | Should -Be "Done"
+  }
+
+  It "maps a CLOSED Epic to Done even when its Status says Ready" {
     MapState ([pscustomobject]@{ AgilityType = "Epic"; AssetState = 128; Status = "Ready" }) | Should -Be "Done"
   }
 
@@ -371,7 +379,7 @@ Describe "MapState" {
     IsAgilityClosed ([pscustomobject]@{ AssetState = 200 }) | Should -BeFalse
   }
 
-  It "uses the per-type map: Story 'Committed' becomes Ready, which is not an Epic state" {
+  It "uses the per-type map: Story 'Committed' becomes Ready, which Epic's map does not know" {
     MapState ([pscustomobject]@{ AgilityType = "Story"; AssetState = 64; Status = "Committed" }) | Should -Be "Ready"
   }
 
@@ -3330,9 +3338,10 @@ Describe "Area path remapping onto the fixed IT tree" {
 # The ready-to-be-pulled state is whatever the target PROCESS calls it, and it is config, not code.
 # Stock Scrum calls it Approved; the client's process dropped Approved from Product Backlog Item and Bug
 # and added a custom Ready [Proposed] in its place (verified live 2026-08-11 against
-# workitemtypes/{type}/states), so mappings.json targets Ready and this fixture mirrors it.
-# AssertStatesExist proves every target against ADO before the first create, so a stale name here
-# kills the run on call one rather than mis-filing items.
+# workitemtypes/{type}/states), so mappings.json targets Ready and this fixture mirrors it. On
+# 2026-08-26 the user added the same Ready to Epic and Feature (verified live), so the Epic map now
+# targets it too. AssertStatesExist proves every target against ADO before the first create, so a
+# stale name here kills the run on call one rather than mis-filing items.
 ##################################################################################################
 Describe "Kanban-style statuses map to real ADO states" {
 
@@ -3358,6 +3367,13 @@ Describe "Kanban-style statuses map to real ADO states" {
             "Not Started" = "Ready"; "In Progress" = "In Progress"
             "Applications" = "In Progress"; "Development" = "In Progress"; "Network" = "In Progress"
             "Done Done" = "Done"; "Completed" = "Done"; "Done" = "Done"
+          }
+        }
+        Epic = [pscustomobject]@{
+          DefaultState = "New"; ClosedState = "Done"; StaleState = "Removed"
+          Map = [pscustomobject]@{
+            "Future" = "New"; "Ready" = "Ready"; "In Progress" = "In Progress"
+            "Done" = "Done"; "Accepted" = "Done"
           }
         }
       }
@@ -3395,11 +3411,25 @@ Describe "Kanban-style statuses map to real ADO states" {
     }
   }
 
+  It "maps every configured Epic status, including 'Ready' to the Ready state added 2026-08-26" {
+    $cases = @{
+      'Future' = 'New'; 'Ready' = 'Ready'; 'Accepted' = 'Done'
+    }
+
+    foreach ($status in $cases.Keys)
+    {
+      $item = [pscustomobject]@{ AgilityType = 'Epic'; Status = $status; AssetState = 'Active' }
+      MapState $item | Should -Be $cases[$status] -Because "Epic '$status' should be $($cases[$status])"
+    }
+  }
+
   # Every target has to be a state the type actually has, or the run dies at AssertStatesExist.
-  It "never maps to a state Product Backlog Item and Bug do not have" {
+  # Epic, Feature, Product Backlog Item and Bug all offer the same five since the user added Ready
+  # to Epic and Feature on 2026-08-26.
+  It "never maps to a state the target types do not have" {
     $real = @('New', 'Ready', 'In Progress', 'Done', 'Removed')
 
-    foreach ($type in @('Story', 'Defect'))
+    foreach ($type in @('Story', 'Defect', 'Epic'))
     {
       $spec = $script:mappings.States.$type
       foreach ($p in $spec.Map.PSObject.Properties)

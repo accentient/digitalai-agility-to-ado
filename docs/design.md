@@ -375,22 +375,22 @@ ADO states are not global, and `mappings.json` keys them per Agility type:
 
 | ADO type | States |
 |---|---|
-| Epic, Feature | New, In Progress, Done, Removed |
+| Epic, Feature | New, **Ready**, In Progress, Done, Removed |
 | Product Backlog Item, Bug | New, **Ready**, In Progress, Done, Removed |
 | Impediment | **Open, Closed** only |
 | Task | **To Do**, In Progress, Done, Removed |
 
-Confirmed against `workitemtypes/{type}/states`, not assumed. The ready-to-be-pulled state does not
-exist on an Epic and `Done` does not exist on an Impediment, so a single shared state map cannot
-work.
+Confirmed against `workitemtypes/{type}/states`, not assumed. `Done` does not exist on an Impediment
+and a Task's proposed state is `To Do`, so a single shared state map cannot work.
 
 **State names are configuration, not code.** Nothing in the script spells a state: every one comes
 from `States.<AgilityType>` in `mappings.json`, and `AssertStatesExist` proves each against the
 states endpoint before the first create, so a name that no longer exists stops the run on call one
 instead of mis-filing items. That matters because a customized process renames these. Stock Scrum
 calls the ready state `Approved`; the client process replaced it with a custom `Ready` in the same
-Proposed category (2026-08-11), and adapting was a `mappings.json` edit and nothing else.
-`mappings.sample.json` still ships the stock `Approved` for that reason.
+Proposed category (2026-08-11), then added the same `Ready` to Epic and Feature (2026-08-26), which
+stock Scrum does not have at all. Adapting was a `mappings.json` edit and nothing else each time.
+`mappings.sample.json` still ships the stock states for that reason.
 
 **Impediment cannot be created as `Closed`.** ADO restricts `System.State` on create to states in
 the **Proposed** category, and Impediment has none: `Open` is InProgress and `Closed` is Completed.
