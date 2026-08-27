@@ -4056,10 +4056,11 @@ function AdoWorkItemUrl($id)
 # at all and 6 still say "In Progress". Mapping on Status alone would recreate 393 finished Epics
 # in Azure DevOps as active work.
 # States are per Agility type, because ADO states differ per work item type: Impediment only has
-# Open and Closed, an Epic has no ready-to-be-pulled state at all, and a Task's proposed state is
-# called To Do rather than New. The names themselves live in mappings.json and are never hard coded
-# here, because a customized process renames them: CWI's Product Backlog Item and Bug have a custom
-# Ready where stock Scrum has Approved. AssertStatesExist proves whatever is configured against ADO.
+# Open and Closed, and a Task's proposed state is called To Do rather than New. The names themselves
+# live in mappings.json and are never hard coded here, because a customized process renames them:
+# CWI's Product Backlog Item and Bug have a custom Ready where stock Scrum has Approved, and on
+# 2026-08-26 the user added the same Ready to Epic and Feature, which stock Scrum lacks entirely.
+# AssertStatesExist proves whatever is configured against ADO.
 function GetStateMap($item)
 {
   $spec = $script:mappings.States.PSObject.Properties[$item.AgilityType]
