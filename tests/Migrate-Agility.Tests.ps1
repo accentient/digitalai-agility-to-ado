@@ -770,6 +770,15 @@ Describe "InvokeWithRetry" {
     ResolveRetryDelay (FakeError 503) 2 | Should -Be 4
   }
 
+  # The 2026-08-04 hardening made a no-response failure transient, but the delay calculation that
+  # runs next indexed Response.Headers without checking there was a Response. So the one failure
+  # that hardening existed to survive threw "Cannot index into a null array" on the way to the
+  # retry, and the item was counted FAIL. It cost TK-141237 on the 2026-09-15 run.
+  It "backs off on a transport failure with no HTTP response, rather than throwing" {
+    { ResolveRetryDelay (FakeError) 1 } | Should -Not -Throw
+    ResolveRetryDelay (FakeError) 1 | Should -Be 2
+  }
+
   # A server can send an absurd Retry-After; a migration must not sleep for an hour on one call.
   It "caps an unreasonable Retry-After" {
     ResolveRetryDelay (FakeError 429 'slow down' 9999) 1 | Should -BeLessOrEqual 120
@@ -900,10 +909,77 @@ Describe "Team as an area path fallback" {
   }
 }
 
+Describe "WriteTrackingTags: the tool's own tags are off unless the config says otherwise" {
+
+  # Everything BuildTags invents - agility-parent, agility-blocks, agility-relates, agility-depends
+  # and agility-source - is bookkeeping the migration adds; Agility has no such tags. As of
+  # 2026-09-16 the user wants them OFF by default, behind one switch in mappings.json. Agility's own
+  # TaggedWith tags are the source's data and are never governed by it.
+  BeforeAll {
+    function NewTrackedItem
+    {
+      return [pscustomobject]@{
+        AgilityType = "Story"; Number = "S-1"; OwnerNames = @(); Status = $null
+        ParentUnresolved = $true; ParentNumberForTag = "E-02581"
+        BlockedUnresolved = @("S-03703"); AssociatedUnresolved = @("S-99"); DependencyUnresolved = @("E-09999")
+        Source = "Employees"; AgilityTags = @("AV", "Classroom")
+      }
+    }
+  }
+
+  It "is off when the key is absent, off when false, on only when true" {
+    $script:mappings = [pscustomobject]@{}
+    ShouldWriteTrackingTags | Should -BeFalse
+
+    $script:mappings = [pscustomobject]@{ WriteTrackingTags = $false }
+    ShouldWriteTrackingTags | Should -BeFalse
+
+    $script:mappings = [pscustomobject]@{ WriteTrackingTags = $true }
+    ShouldWriteTrackingTags | Should -BeTrue
+  }
+
+  It "writes only Agility's own tags when the switch is off" {
+    $script:mappings = [pscustomobject]@{}
+
+    BuildTags (NewTrackedItem) | Should -Be "AV; Classroom"
+  }
+
+  It "writes every tracking family when the switch is on" {
+    $script:mappings = [pscustomobject]@{ WriteTrackingTags = $true }
+
+    $tags = BuildTags (NewTrackedItem)
+
+    foreach ($expected in @('agility-parent:E-02581', 'agility-blocks:S-03703', 'agility-relates:S-99', 'agility-depends:E-09999', 'agility-source:Employees', 'AV', 'Classroom'))
+    {
+      $tags | Should -BeLike "*$expected*"
+    }
+  }
+
+  # The log line must not promise a tag the run will not write.
+  It "only says 'keeping it as a tag' in the warning when a tag will actually be written" {
+    $script:mappings = [pscustomobject]@{}
+    TrackingTagNote "it" | Should -Be ""
+
+    $script:mappings = [pscustomobject]@{ WriteTrackingTags = $true }
+    TrackingTagNote "it"   | Should -Be ", keeping it as a tag"
+    TrackingTagNote "them" | Should -Be ", keeping them as tags"
+  }
+
+  It "ships the switch in both config files, defaulted off" {
+    foreach ($file in @('mappings.json', 'mappings.sample.json'))
+    {
+      $json = Get-Content (Join-Path $PSScriptRoot ".." $file) -Raw | ConvertFrom-Json
+      $json.PSObject.Properties['WriteTrackingTags'] | Should -Not -BeNullOrEmpty -Because "$file must carry the switch"
+      $json.WriteTrackingTags | Should -BeFalse -Because "$file must default it off"
+    }
+  }
+}
+
 Describe "BuildTags" {
 
   BeforeAll {
     $script:mappings = [pscustomobject]@{
+      WriteTrackingTags = $true
       States = [pscustomobject]@{
         Story = [pscustomobject]@{
           DefaultState = "New"; ClosedState = "Done"
@@ -1055,6 +1131,7 @@ Describe "Agility id and status go to fields, not tags" {
 
   BeforeAll {
     $script:mappings = [pscustomobject]@{
+      WriteTrackingTags = $true
       RequiredFields = [pscustomobject]@{
         AgilityId       = "Custom.DigitalAIID"
         AgilityStatus   = "Custom.DigitalAIStatus"
@@ -3471,6 +3548,7 @@ Describe "Issue associated links become Related" {
 
   BeforeAll {
     $script:mappings = [pscustomobject]@{
+      WriteTrackingTags = $true
       LinkTypes = [pscustomobject]@{
         Parent  = "System.LinkTypes.Hierarchy-Reverse"
         Related = "System.LinkTypes.Related"
@@ -4470,7 +4548,7 @@ Describe "Epic extras the audit found: parser" {
 Describe "Epic extras the audit found: tags" {
 
   BeforeAll {
-    $script:mappings = [pscustomobject]@{ Tags = [pscustomobject]@{} }
+    $script:mappings = [pscustomobject]@{ Tags = [pscustomobject]@{}; WriteTrackingTags = $true }
 
     function NewTagItem($props)
     {
@@ -4528,34 +4606,40 @@ Describe "Epic dependencies become Successor and Predecessor links" {
     }
   }
 
-  It "resolves a dependency that is already in Azure DevOps" {
+  # Direction, verified against a real pair on 2026-09-16 (S-01060 / S-01481 in both systems):
+  # Agility's Dependencies are what an item depends ON - the upstream work that must come first -
+  # so in ADO they are the item's PREDECESSORS (Dependency-Reverse). Dependants are the downstream
+  # items that depend on it, so they are its SUCCESSORS (Dependency-Forward). The first version had
+  # these swapped, and every dependency link on the 2026-09-15 IT run points the wrong way.
+  It "resolves a Dependency (what this item depends on) as a PREDECESSOR" {
     $r = ResolveDependencyIds (NewDepItem @("E-2") @()) @{ "E-2" = 101 }
 
-    $r.Successors   | Should -Be @(101)
-    $r.Predecessors | Should -BeNullOrEmpty
+    $r.Predecessors | Should -Be @(101)
+    $r.Successors   | Should -BeNullOrEmpty
     $r.Unresolved   | Should -BeNullOrEmpty
   }
 
-  It "resolves the other end as a predecessor" {
+  It "resolves a Dependant (what depends on this item) as a SUCCESSOR" {
     $r = ResolveDependencyIds (NewDepItem @() @("E-3")) @{ "E-3" = 202 }
 
-    $r.Predecessors | Should -Be @(202)
+    $r.Successors   | Should -Be @(202)
+    $r.Predecessors | Should -BeNullOrEmpty
   }
 
   # An Epic outside the configured scopes keeps its number as a tag, the same as an unmigrated parent.
   It "reports a dependency that is not in Azure DevOps as unresolved" {
     $r = ResolveDependencyIds (NewDepItem @("E-9") @()) @{}
 
-    $r.Successors | Should -BeNullOrEmpty
-    $r.Unresolved | Should -Be @("E-9")
+    $r.Predecessors | Should -BeNullOrEmpty
+    $r.Unresolved   | Should -Be @("E-9")
   }
 
   # A dry run creates nothing, so a target this run WOULD create must not be reported as a miss.
   It "does not count an item this run would create as unresolved" {
     $r = ResolveDependencyIds (NewDepItem @("E-4") @()) @{ "E-4" = $script:DryRunPendingId }
 
-    $r.Unresolved  | Should -BeNullOrEmpty
-    $r.Successors  | Should -BeNullOrEmpty
+    $r.Unresolved   | Should -BeNullOrEmpty
+    $r.Predecessors | Should -BeNullOrEmpty
   }
 }
 
@@ -4690,8 +4774,8 @@ Describe "Dependency partners inside the same run are not reported missing" {
 
     $r = ResolveDependencyIds (DepItem @('S-2')) @{}
 
-    $r.Unresolved | Should -BeNullOrEmpty -Because "S-2 is in this run; the link is written from its side"
-    $r.Successors | Should -BeNullOrEmpty
+    $r.Unresolved   | Should -BeNullOrEmpty -Because "S-2 is in this run; the link is written from its side"
+    $r.Predecessors | Should -BeNullOrEmpty
   }
 
   # The tag still has to appear for a partner that is genuinely outside the configured scopes,
@@ -4705,7 +4789,8 @@ Describe "Dependency partners inside the same run are not reported missing" {
   It "still links a partner that already exists" {
     $script:numbersInRun = @{ 'S-2' = $true }
 
-    (ResolveDependencyIds (DepItem @('S-2')) @{ 'S-2' = 101 }).Successors | Should -Be @(101)
+    # A Dependency is what the item depends on, so the partner is a predecessor (direction fixed 2026-09-16).
+    (ResolveDependencyIds (DepItem @('S-2')) @{ 'S-2' = 101 }).Predecessors | Should -Be @(101)
   }
 
   # With no run set populated the old behaviour must hold, so every other caller and older test is
