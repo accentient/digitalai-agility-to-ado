@@ -163,6 +163,36 @@ state transition, links, and close date need a real item, so they are not covere
 option was removed rather than left as a trap. Items whose source `AssetState` is *Dead* are the one
 exclusion; those are placeholder templates and are never created.
 
+## Tracking tags
+
+The migration can add its own tags to `System.Tags` to record things it could not link or file: the
+number of a parent, blocked item, related item or dependency that is not in Azure DevOps, and the
+source item's Source value. The source system has no such tags, and every one becomes a permanent tag
+definition in the project, so they are **off by default**. Set `"WriteTrackingTags": true` in
+`mappings.json` to write them. The source's own tag list is always copied regardless.
+
+## Creating iterations
+
+The migration writes each Story, Defect and Task that sits in an Agility Timebox to the iteration
+path `<Project>\<Timebox name>`, and Azure DevOps rejects an unknown iteration path outright. The
+nodes therefore have to exist before the migration runs, and the migration does not create them. A
+separate, self-contained script does:
+
+```powershell
+./src/Create-Iterations.ps1
+```
+
+It reads every configured scope, collects each distinct Timebox with its start and end dates, and
+creates a flat node under the project root for each one that is missing. It is idempotent: a node
+that already exists is left alone, so it can be run and re-run. Every node is read back afterwards
+to prove the dates landed. `CreateIterations -DryRun` in `Main` lists what a run would add.
+
+Agility's timebox end date is exclusive (it is the day the next sprint starts) while Azure DevOps'
+finish date is inclusive, so each node finishes the day before Agility's end date: a three week
+sprint that starts on a Wednesday finishes on the Tuesday, and the next one starts the following
+Wednesday. `CreateIterations -RepairDates` corrects the dates on nodes that already exist and is the
+only thing in the script that ever updates a node.
+
 ## Removing work items
 
 Deleting is a **separate script**, and the separation is deliberate. The migration only ever creates

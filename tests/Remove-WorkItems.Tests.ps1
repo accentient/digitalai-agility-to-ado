@@ -333,6 +333,16 @@ Describe "Retry" {
     IsTransientFailure $noResponse | Should -BeTrue
   }
 
+  # Transient is not enough: the delay calculation that runs next must survive the missing Response
+  # too, or the retry throws instead of waiting. It cost the migration an item on 2026-09-15.
+  It "backs off on a failure with no response, rather than throwing" {
+    $noResponse = [System.Management.Automation.ErrorRecord]::new(
+      [Exception]::new("The operation has timed out"), "timeout", 'OperationTimeout', $null)
+
+    { ResolveRetryDelay $noResponse 1 } | Should -Not -Throw
+    ResolveRetryDelay $noResponse 1 | Should -Be 2
+  }
+
   It "gives up immediately on a permanent failure, rather than retrying a 400" {
     Mock IsTransientFailure { return $false }
     $script:attempts = 0

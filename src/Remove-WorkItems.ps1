@@ -421,7 +421,13 @@ function ResolveRetryDelay($errorRecord, [int]$attempt)
 {
   $backoff = [int][Math]::Pow(2, $attempt)
 
-  $header = $errorRecord.Exception.Response.Headers['Retry-After']
+  # A transport failure (timeout, dropped connection) has NO Response, and indexing into its Headers
+  # threw "Cannot index into a null array" on the way to the retry - the very failure the retry was
+  # hardened to survive. Found the hard way: it cost TK-141237 on the 2026-09-15 run.
+  $response = $errorRecord.Exception.Response
+  if (-not $response) { return [Math]::Min($backoff, $script:MaxRetryDelaySeconds) }
+
+  $header = $response.Headers['Retry-After']
   # Headers commonly arrive as a single element collection rather than a bare value.
   if ($header -is [array]) { $header = @($header)[0] }
 

@@ -1775,9 +1775,14 @@ function ResolveDependencyIds($item, $existing)
   $predecessors = @()
   $unresolved = @()
 
+  # Direction (corrected 2026-09-16, after every link on the first IT run pointed the wrong way):
+  # Agility's Dependencies are what this item depends ON - upstream work that must come first - so
+  # they are its PREDECESSORS. Dependants are the downstream items that depend on it, so they are
+  # its SUCCESSORS. Verified on a real pair in both systems: S-01060 lists S-01481 ("Business
+  # Processes - Identification") as a Dependency, and S-01481 lists S-01060 back as a Dependant.
   foreach ($pair in @(
-    @{ Numbers = @($item.DependencyNumbers); Into = 'successor' },
-    @{ Numbers = @($item.DependantNumbers);  Into = 'predecessor' }))
+    @{ Numbers = @($item.DependencyNumbers); Into = 'predecessor' },
+    @{ Numbers = @($item.DependantNumbers);  Into = 'successor' }))
   {
     foreach ($number in $pair.Numbers)
     {
@@ -1876,7 +1881,7 @@ function MigrateItem($epic, $existing)
 
   if ($parentUnresolved)
   {
-    WriteLog "  WARN    $($epic.Number) parent $parentNumber is not in Azure DevOps, keeping it as a tag and creating this unparented" Yellow
+    WriteLog "  WARN    $($epic.Number) parent $parentNumber is not in Azure DevOps$(TrackingTagNote "it"), creating this unparented" Yellow
     $script:warnings++
   }
 
@@ -1886,7 +1891,7 @@ function MigrateItem($epic, $existing)
 
   if ($blocked.Unresolved.Count -gt 0)
   {
-    WriteLog "  WARN    $($epic.Number) blocks $($blocked.Unresolved -join ', '), which are not in Azure DevOps, keeping them as tags" Yellow
+    WriteLog "  WARN    $($epic.Number) blocks $($blocked.Unresolved -join ', '), which are not in Azure DevOps$(TrackingTagNote "them")" Yellow
     $script:warnings++
   }
 
@@ -1897,7 +1902,7 @@ function MigrateItem($epic, $existing)
 
   if ($associated.Unresolved.Count -gt 0)
   {
-    WriteLog "  WARN    $($epic.Number) relates to $($associated.Unresolved -join ', '), which are not in Azure DevOps, keeping them as tags" Yellow
+    WriteLog "  WARN    $($epic.Number) relates to $($associated.Unresolved -join ', '), which are not in Azure DevOps$(TrackingTagNote "them")" Yellow
     $script:warnings++
   }
 
@@ -1907,7 +1912,7 @@ function MigrateItem($epic, $existing)
 
   if ($dependencies.Unresolved.Count -gt 0)
   {
-    WriteLog "  WARN    $($epic.Number) depends on $($dependencies.Unresolved -join ', '), which are not in Azure DevOps, keeping them as tags" Yellow
+    WriteLog "  WARN    $($epic.Number) depends on $($dependencies.Unresolved -join ', '), which are not in Azure DevOps$(TrackingTagNote "them")" Yellow
     $script:warnings++
   }
 
@@ -2999,7 +3004,7 @@ function AddAdoDependencyLinks([int]$id, $epic, $dependencies)
       value = @{
         rel        = ($script:mappings.LinkTypes.Successor)
         url        = (AdoWorkItemUrl $successorId)
-        attributes = @{ comment = "Agility dependency of $($epic.Number)." }
+        attributes = @{ comment = "Agility dependant of $($epic.Number)." }
       }
     }
   }
@@ -3011,7 +3016,7 @@ function AddAdoDependencyLinks([int]$id, $epic, $dependencies)
       value = @{
         rel        = ($script:mappings.LinkTypes.Predecessor)
         url        = (AdoWorkItemUrl $predecessorId)
-        attributes = @{ comment = "Agility dependant of $($epic.Number)." }
+        attributes = @{ comment = "Agility dependency of $($epic.Number)." }
       }
     }
   }
@@ -3839,41 +3844,74 @@ function BuildAgilityDetails($item)
 # Custom.DigitalAI* fields, and sprint is the iteration path plus a description line.
 #
 # ADO separates tags with semicolons, so any semicolon inside a value is replaced.
+#
+# The tracking families are behind ShouldWriteTrackingTags; see there.
+
+# Whether the migration writes its own tracking tags (agility-parent, agility-blocks,
+# agility-relates, agility-depends, agility-source). Read from mappings.json WriteTrackingTags,
+# and OFF unless that key is present and true: an absent key, false, or anything that is not a
+# boolean true all mean off, so an unconfigured run adds nothing of ours to the tag store.
+function ShouldWriteTrackingTags
+{
+  if (-not $script:mappings) { return $false }
+  if (-not $script:mappings.PSObject.Properties['WriteTrackingTags']) { return $false }
+
+  return ($script:mappings.WriteTrackingTags -eq $true)
+}
+
+# The tail of an unresolved-link warning: ", keeping it as a tag" only when a tag WILL be written,
+# otherwise nothing, so the log never promises a tag the run does not add.
+function TrackingTagNote([string]$pronoun)
+{
+  if (-not (ShouldWriteTrackingTags)) { return "" }
+
+  if ($pronoun -eq "them") { return ", keeping them as tags" }
+  return ", keeping $pronoun as a tag"
+}
+
 function BuildTags($item)
 {
   $tags = @()
 
-  # An Agility parent that is not in ADO cannot be linked, so keep the number. Otherwise an item
-  # whose Epic lives in a scope that is not configured would land in ADO with nothing to say it ever
-  # had a parent.
-  if ($item.ParentUnresolved -and $item.ParentNumberForTag) { $tags += "agility-parent:$($item.ParentNumberForTag)" }
-
-  # Same rule for a blocked work item outside the configured scopes: the Affects link cannot be
-  # made, so the number stays.
-  foreach ($number in @($item.BlockedUnresolved))
+  # Everything in this block is bookkeeping the MIGRATION invents - Agility has no such tags - and
+  # since 2026-09-16 it is written only when mappings.json says WriteTrackingTags is true. Off by
+  # default: the user found 10,000 retired definitions of these in the old project's tag store and
+  # wants none added unless asked. The warnings in MigrateItem still record every unresolved link
+  # in the log either way; the tag is the queryable copy, not the only record.
+  if (ShouldWriteTrackingTags)
   {
-    if ($number) { $tags += "agility-blocks:$number" }
+    # An Agility parent that is not in ADO cannot be linked, so keep the number. Otherwise an item
+    # whose Epic lives in a scope that is not configured would land in ADO with nothing to say it
+    # ever had a parent.
+    if ($item.ParentUnresolved -and $item.ParentNumberForTag) { $tags += "agility-parent:$($item.ParentNumberForTag)" }
+
+    # Same rule for a blocked work item outside the configured scopes: the Affects link cannot be
+    # made, so the number stays.
+    foreach ($number in @($item.BlockedUnresolved))
+    {
+      if ($number) { $tags += "agility-blocks:$number" }
+    }
+
+    # And the weaker association, same rule: the Related link cannot be made to something outside
+    # the configured scopes, so the number is what is left of the relationship.
+    foreach ($number in @($item.AssociatedUnresolved))
+    {
+      if ($number) { $tags += "agility-relates:$number" }
+    }
+
+    # An Epic dependency whose other end is outside the configured scopes: the link cannot be made,
+    # so the number stays, same rule as the parent and the blocked items.
+    foreach ($number in @($item.DependencyUnresolved))
+    {
+      if ($number) { $tags += "agility-depends:$number" }
+    }
+
+    # Source, on Defect (23 of 706) and Epic (93 of 877). A tag, not a field, by request. Epic's
+    # selection did not ask for it until the 2026-07-30 field audit, so those 93 were being dropped.
+    if ($item.Source) { $tags += "agility-source:$($item.Source)" }
   }
 
-  # And the weaker association, same rule: the Related link cannot be made to something outside the
-  # configured scopes, so the number is what is left of the relationship.
-  foreach ($number in @($item.AssociatedUnresolved))
-  {
-    if ($number) { $tags += "agility-relates:$number" }
-  }
-
-  # An Epic dependency whose other end is outside the configured scopes: the link cannot be made, so
-  # the number stays, same rule as the parent and the blocked items.
-  foreach ($number in @($item.DependencyUnresolved))
-  {
-    if ($number) { $tags += "agility-depends:$number" }
-  }
-
-  # Source, on Defect (23 of 706) and Epic (93 of 877). A tag, not a field, by request. Epic's
-  # selection did not ask for it until the 2026-07-30 field audit, so those 93 were being dropped.
-  if ($item.Source) { $tags += "agility-source:$($item.Source)" }
-
-  # Agility's own tag list. 27 Epics carry one, up to 5 tags each, and System.Tags is the obvious
+  # Agility's own tag list. NOT governed by the switch: these are the source's data, not ours. 27 Epics carry one, up to 5 tags each, and System.Tags is the obvious
   # home since the tool already writes it.
   foreach ($tag in @($item.AgilityTags))
   {
@@ -4369,7 +4407,13 @@ function ResolveRetryDelay($errorRecord, [int]$attempt)
 {
   $backoff = [int][Math]::Pow(2, $attempt)
 
-  $header = $errorRecord.Exception.Response.Headers['Retry-After']
+  # A transport failure (timeout, dropped connection) has NO Response, and indexing into its Headers
+  # threw "Cannot index into a null array" on the way to the retry - the very failure the retry was
+  # hardened to survive. Found the hard way: it cost TK-141237 on the 2026-09-15 run.
+  $response = $errorRecord.Exception.Response
+  if (-not $response) { return [Math]::Min($backoff, $script:MaxRetryDelaySeconds) }
+
+  $header = $response.Headers['Retry-After']
   # Headers commonly arrive as a single element collection rather than a bare value.
   if ($header -is [array]) { $header = @($header)[0] }
 

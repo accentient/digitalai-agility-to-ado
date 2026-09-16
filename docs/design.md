@@ -57,6 +57,11 @@ the other, and tests assert the gap in both directions. The plumbing is duplicat
 shared file would give the two a common blast radius, which is an air gap in name only. See
 `docs/superpowers/specs/2026-08-05-remove-workitems-air-gap-design.md`.
 
+**Iteration nodes come from a third self-contained script**, `src/Create-Iterations.ps1`, which
+only ever creates classification nodes: it derives the list from Agility's timeboxes, creates the
+ones that are missing, and reads each back to prove the dates landed. Same plumbing duplication, same
+GET-only door to Agility, same tests asserting the gap.
+
 **It is a migration, not a sync.** An already-migrated item is matched by `Custom.DigitalAIID` and
 skipped *before any field is compared*, so later Agility edits, state changes, and new links between
 existing items are never brought across, and items deleted in Agility are never removed from ADO.
@@ -547,6 +552,13 @@ ordering, and the skip path.
 `Timebox` is Agility's sprint. Stories and Defects reference **142 distinct timeboxes**, all from
 the single `Org - 3 weeks` schedule. All 142 were created as iteration nodes directly under
 `Migration`, with their real start and end dates (Sprint 001 in 2018 through Sprint 142 in 2026).
+That was done ad hoc; since 2026-09-15 `src/Create-Iterations.ps1` does it, idempotently, and it
+walks Story, Defect and Task because the migration writes an iteration path on all three.
+
+**Agility's `EndDate` is exclusive; ADO's finish date is inclusive.** Every timebox on the schedule
+begins on a Wednesday and ends on the Wednesday the next one begins, so copying the end date
+verbatim overlapped every sprint with its successor by a day. The script sends the day before, a
+Tuesday, and `-RepairDates` fixed the 142 nodes that had already been created the old way.
 
 Two traps here:
 
@@ -560,7 +572,8 @@ node (`Migration\Org - 3 weeks\Sprint 138`).
 **Iteration dates need full ISO 8601.** `"startDate": "2026-08-26"` is **silently ignored**: the
 API returns HTTP 200 and creates the node with no dates at all. `"2026-08-26T00:00:00Z"` persists.
 Both look identical unless the node is re-read, so always verify dates after writing them. Dates
-also cannot be set on the create call reliably; they are applied with a follow up PATCH.
+also cannot be set on the create call reliably; `Create-Iterations.ps1` sends them on the create,
+reads the node back, and patches them onto a node it just made when they did not take.
 
 ## Themes: the area path source for Stories
 
