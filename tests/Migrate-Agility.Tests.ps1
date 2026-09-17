@@ -968,7 +968,12 @@ Describe "WriteTrackingTags: the tool's own tags are off unless the config says 
   It "ships the switch in both config files, defaulted off" {
     foreach ($file in @('mappings.json', 'mappings.sample.json'))
     {
-      $json = Get-Content (Join-Path $PSScriptRoot ".." $file) -Raw | ConvertFrom-Json
+      # mappings.json is gitignored, so a fresh clone (CI) has only the sample. The sample must
+      # always be there; the local file is checked whenever it exists.
+      $path = Join-Path $PSScriptRoot ".." $file
+      if ($file -eq 'mappings.json' -and -not (Test-Path $path)) { continue }
+
+      $json = Get-Content $path -Raw | ConvertFrom-Json
       $json.PSObject.Properties['WriteTrackingTags'] | Should -Not -BeNullOrEmpty -Because "$file must carry the switch"
       $json.WriteTrackingTags | Should -BeFalse -Because "$file must default it off"
     }
