@@ -153,6 +153,10 @@ function Migrate([switch]$DryRun, [string]$Scope, [string[]]$Types = @('Epic','S
   {
     WriteLog "Archiving: work finished before $($script:staleBefore.ToString('yyyy-MM-dd')) is created Removed, not Done" Yellow
   }
+  if (ShouldWriteAgilityHyperlink)
+  {
+    WriteLog "Hyperlinks: every created item links back to $((BuildAgilityUrl 'NUMBER') -replace 'NUMBER$', '<Number>')"
+  }
   WriteLog
 
   WriteLog "Resolving credentials..."
@@ -2461,6 +2465,53 @@ function BuildHyperlinkOps($epic)
   return $ops
 }
 
+# Whether each created item gets a hyperlink back to its source record in Agility. Read from
+# mappings.json WriteAgilityHyperlink, and OFF unless that key is present and true, the same rule
+# as WriteTrackingTags: an absent key, false, or anything that is not a boolean true all mean off.
+function ShouldWriteAgilityHyperlink
+{
+  if (-not $script:mappings) { return $false }
+  if (-not $script:mappings.PSObject.Properties['WriteAgilityHyperlink']) { return $false }
+
+  return ($script:mappings.WriteAgilityHyperlink -eq $true)
+}
+
+# The page in Agility for one Number. assetdetail.v1 resolves the Number itself and redirects to the
+# right page for the asset's type (story.mvc, Task.mvc, Epic.mvc, defect.mvc, Issue.mvc), and is a
+# 404 for a Number that does not exist - verified live 2026-09-17 on all five types. So neither the
+# oid nor the type is needed. It is only ever a string in a relation: nothing here CALLS it.
+function BuildAgilityUrl([string]$number)
+{
+  return "{0}/assetdetail.v1?Number={1}" -f $script:config.Agility.BaseUrl.TrimEnd('/'), [uri]::EscapeDataString($number)
+}
+
+# The Hyperlink relation op that points a created item back at its Agility source, or $null when
+# the switch is off or the item has no Number to build it from. The url and the comment are spelled
+# exactly as the standalone hyperlink script spells them, so a project migrated with the switch on
+# reads as already linked there and never gets a second copy.
+#
+# $null too when the item's own Agility Links already hold this url: two identical relations in one
+# create is a payload ADO can reject, and the create is atomic, so the item would never be made.
+function BuildSourceHyperlinkOp($epic)
+{
+  if (-not (ShouldWriteAgilityHyperlink)) { return $null }
+
+  $number = "$($epic.Number)".Trim()
+  if (-not $number) { return $null }
+
+  $url = BuildAgilityUrl $number
+  foreach ($existing in @($epic.LinkUrls | Where-Object { $_ }))
+  {
+    if ([string]::Equals("$existing", $url, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+  }
+
+  return @{
+    op    = "add"
+    path  = "/relations/-"
+    value = @{ rel = "Hyperlink"; url = $url; attributes = @{ comment = "digital.ai Agility $number" } }
+  }
+}
+
 # Who closed the Epic, for Microsoft.VSTS.Common.ClosedBy: email first, then display name, and only
 # if ADO will actually accept the identity.
 #
@@ -2855,6 +2906,12 @@ function NewAdoWorkItem($epic, $parentId, $trueParentId, $blockedIds, $associate
 
   # Agility Links that are real URLs become ADO hyperlinks; the rest are in the description.
   $patch += BuildHyperlinkOps $epic
+
+  # And, when mappings.json asks for it, one more hyperlink: back to the source record in Agility.
+  # Safe in the create for the same reason the Links above are - a Hyperlink has no graph rule ADO
+  # could reject the whole item over - and it costs no extra call and no extra revision.
+  $sourceLinkOp = BuildSourceHyperlinkOp $epic
+  if ($sourceLinkOp) { $patch += $sourceLinkOp }
 
   # A flattened Epic hangs off the root rather than its real parent, so record the real parent as
   # a Related link. Hierarchy-Reverse would be the honest link type, but it is exactly the same
