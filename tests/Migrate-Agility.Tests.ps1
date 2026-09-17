@@ -980,6 +980,142 @@ Describe "WriteTrackingTags: the tool's own tags are off unless the config says 
   }
 }
 
+Describe "WriteAgilityHyperlink: a link back to the Agility source record, off unless the config says otherwise" {
+
+  # Added 2026-09-17. The standalone hyperlink script proved the link on six Training items first;
+  # this is the same link riding in the create, behind one switch in mappings.json.
+  BeforeEach {
+    $script:config = [pscustomobject]@{
+      Agility     = [pscustomobject]@{ BaseUrl = "https://www10.v1host.com/CWI/" }
+      AzureDevOps = [pscustomobject]@{ OrganizationUrl = "https://dev.azure.com/org"; Project = "Migration" }
+    }
+    $script:mappings = [pscustomobject]@{ WriteAgilityHyperlink = $true }
+  }
+
+  It "is off when the key is absent, off when false, on only when a boolean true" {
+    $script:mappings = [pscustomobject]@{}
+    ShouldWriteAgilityHyperlink | Should -BeFalse
+
+    $script:mappings = [pscustomobject]@{ WriteAgilityHyperlink = $false }
+    ShouldWriteAgilityHyperlink | Should -BeFalse
+
+    $script:mappings = [pscustomobject]@{ WriteAgilityHyperlink = "yes" }
+    ShouldWriteAgilityHyperlink | Should -BeFalse
+
+    $script:mappings = [pscustomobject]@{ WriteAgilityHyperlink = $true }
+    ShouldWriteAgilityHyperlink | Should -BeTrue
+  }
+
+  # assetdetail.v1 resolves a Number for every asset type, so neither the oid nor the type is needed.
+  It "builds the assetdetail.v1 url from the configured base and the Number, with no doubled slash" {
+    BuildAgilityUrl 'S-40245'   | Should -Be 'https://www10.v1host.com/CWI/assetdetail.v1?Number=S-40245'
+    BuildAgilityUrl 'TK-141988' | Should -Be 'https://www10.v1host.com/CWI/assetdetail.v1?Number=TK-141988'
+  }
+
+  It "builds one Hyperlink relation op, with the Number as the comment the Links tab shows" {
+    $op = BuildSourceHyperlinkOp ([pscustomobject]@{ Number = "S-40245"; LinkUrls = @() })
+
+    $op.op    | Should -Be "add"
+    $op.path  | Should -Be "/relations/-"
+    $op.value.rel | Should -Be "Hyperlink"
+    $op.value.url | Should -Be 'https://www10.v1host.com/CWI/assetdetail.v1?Number=S-40245'
+    $op.value.attributes.comment | Should -Be 'digital.ai Agility S-40245'
+  }
+
+  It "builds nothing when the switch is off, and nothing for an item with no Number" {
+    BuildSourceHyperlinkOp ([pscustomobject]@{ Number = ""; LinkUrls = @() }) | Should -BeNullOrEmpty
+
+    $script:mappings = [pscustomobject]@{}
+    BuildSourceHyperlinkOp ([pscustomobject]@{ Number = "S-40245"; LinkUrls = @() }) | Should -BeNullOrEmpty
+  }
+
+  # Two identical relations in one create is a payload ADO can reject, and the create is atomic.
+  It "builds nothing when the item's own Agility Links already hold the same url, whatever its case" {
+    $item = [pscustomobject]@{ Number = "S-40245"; LinkUrls = @("https://WWW10.v1host.com/cwi/assetdetail.v1?number=s-40245") }
+
+    BuildSourceHyperlinkOp $item | Should -BeNullOrEmpty
+  }
+
+  It "survives an item that has no LinkUrls property at all" {
+    (BuildSourceHyperlinkOp ([pscustomobject]@{ Number = "TK-1" })).value.url | Should -Match 'Number=TK-1$'
+  }
+
+  Context "in the create" {
+
+    BeforeEach {
+      $script:sent = $null
+      Mock InvokeAdoRequest { $script:sent = $body; return [pscustomobject]@{ id = 42 } }
+      # Two ops, because a one element array unrolls to a bare hashtable on the way out of a mock and
+      # the real patch is never that short.
+      Mock BuildFieldPatch { return @(@{ op = "add"; path = "/fields/System.Title"; value = "x" }, @{ op = "add"; path = "/fields/System.Description"; value = "y" }) }
+      Mock BuildHistoryHeaderOps { return @() }
+      Mock BuildClosedByOp { return $null }
+
+      $script:item = [pscustomobject]@{ Number = "S-40245"; AdoType = "Product Backlog Item"; LinkUrls = @("https://example.com/doc"); LinkNames = @("A doc") }
+    }
+
+    It "rides in the create beside the item's own Agility Links when the switch is on" {
+      NewAdoWorkItem $script:item $null $null @() @() | Should -Be 42
+
+      $links = @($script:sent | Where-Object { $_.path -eq '/relations/-' -and $_.value.rel -eq 'Hyperlink' })
+      $links.Count | Should -Be 2
+      @($links | ForEach-Object { $_.value.url }) | Should -Contain 'https://www10.v1host.com/CWI/assetdetail.v1?Number=S-40245'
+      @($links | ForEach-Object { $_.value.url }) | Should -Contain 'https://example.com/doc'
+    }
+
+    It "adds nothing to the create when the switch is off, so an unconfigured run is exactly as before" {
+      $script:mappings = [pscustomobject]@{}
+
+      NewAdoWorkItem $script:item $null $null @() @() | Out-Null
+
+      $links = @($script:sent | Where-Object { $_.path -eq '/relations/-' -and $_.value.rel -eq 'Hyperlink' })
+      $links.Count | Should -Be 1
+      $links[0].value.url | Should -Be 'https://example.com/doc'
+    }
+  }
+
+  # The url is only ever a string in a relation. The read only rule on Agility is about CALLS, and
+  # this adds none: every line that builds the url is a format string, not a request.
+  It "never calls the url it builds" {
+    $source = Get-Content $script:scriptPath -Raw
+    foreach ($name in 'BuildAgilityUrl', 'BuildSourceHyperlinkOp')
+    {
+      $body = [regex]::Match($source, "function $name\b[\s\S]*?(?=\r?\n(?:#|function ))").Value
+      $body | Should -Not -BeNullOrEmpty
+      $body | Should -Not -Match 'Invoke-RestMethod|Invoke-WebRequest|InvokeAgility'
+    }
+  }
+
+  # The standalone script and the migration must write the SAME link, or a project migrated with the
+  # switch on would get a second copy from the script. Code may not cross reference, so this compares
+  # the two spellings from the outside.
+  It "spells the url and the comment exactly as the standalone hyperlink script does" {
+    $standalone = Join-Path $PSScriptRoot ".." "src" "Add-Hyperlinks.ps1"
+    if (-not (Test-Path $standalone)) { Set-ItResult -Skipped -Because "the standalone script is not present"; return }
+
+    foreach ($path in @($script:scriptPath, $standalone))
+    {
+      $source = Get-Content $path -Raw
+      $source | Should -Match ([regex]::Escape('"{0}/assetdetail.v1?Number={1}" -f $script:config.Agility.BaseUrl.TrimEnd(''/''), [uri]::EscapeDataString($number)')) -Because $path
+      $source | Should -Match ([regex]::Escape('comment = "digital.ai Agility $number"')) -Because $path
+    }
+  }
+
+  It "ships the switch in both config files, defaulted off" {
+    foreach ($file in @('mappings.json', 'mappings.sample.json'))
+    {
+      $path = Join-Path $PSScriptRoot ".." $file
+      if ($file -eq 'mappings.json' -and -not (Test-Path $path)) { continue }
+
+      $json = Get-Content $path -Raw | ConvertFrom-Json
+      $json.PSObject.Properties['WriteAgilityHyperlink'] | Should -Not -BeNullOrEmpty -Because "$file must carry the switch"
+      $json.WriteAgilityHyperlink | Should -BeOfType [bool] -Because "anything but a boolean true reads as off"
+    }
+
+    (Get-Content (Join-Path $PSScriptRoot ".." 'mappings.sample.json') -Raw | ConvertFrom-Json).WriteAgilityHyperlink | Should -BeFalse
+  }
+}
+
 Describe "BuildTags" {
 
   BeforeAll {
