@@ -171,6 +171,21 @@ source item's Source value. The source system has no such tags, and every one be
 definition in the project, so they are **off by default**. Set `"WriteTrackingTags": true` in
 `mappings.json` to write them. The source's own tag list is always copied regardless.
 
+## Repairing dependency direction
+
+Until 2026-09-16 the migration wrote Agility's Dependencies as Successor links and its Dependants as
+Predecessor links, the reverse of what they mean. The migration is fixed; a project migrated before
+that needs its links turned round, and that cannot be done one item at a time because Azure DevOps
+checks the whole graph for cycles on every add. A separate, self-contained script does it in two
+passes over the whole project, with an inventory saved to disk first, a stop check between the
+passes, and a link-by-link verification at the end:
+
+```powershell
+./src/Repair-DependencyDirection.ps1
+```
+
+`Main` ships with `-DryRun`. It only ever touches `/relations`, never a field, never a work item.
+
 ## Creating iterations
 
 The migration writes each Story, Defect and Task that sits in an Agility Timebox to the iteration
