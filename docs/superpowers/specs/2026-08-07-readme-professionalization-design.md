@@ -126,7 +126,8 @@ for cosmetics would weaken the assertions. They are node names, not client ident
 1. `Invoke-Pester -Path tests` still reports 491 passed, 0 failed. No source file is edited, so this
    is a regression check on the scrub, not on behaviour.
 2. `git ls-files` no longer lists `logs/half-migrated-epic-ids.txt`.
-3. `git grep -niE "YourInstance|myClient"` over tracked non-test files returns nothing.
+3. A case-insensitive `git grep` for the client's name, and for the area path node derived from it,
+   returns nothing over tracked non-test files.
 4. Every link in the new README resolves to a file that exists in the repo.
 5. The workflow YAML parses and its step order matches the local command that produced the 491/0
    baseline.

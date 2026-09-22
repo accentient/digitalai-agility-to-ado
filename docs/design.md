@@ -392,7 +392,7 @@ and a Task's proposed state is `To Do`, so a single shared state map cannot work
 from `States.<AgilityType>` in `mappings.json`, and `AssertStatesExist` proves each against the
 states endpoint before the first create, so a name that no longer exists stops the run on call one
 instead of mis-filing items. That matters because a customized process renames these. Stock Scrum
-calls the ready state `Approved`; the client process replaced it with a custom `Ready` in the same
+calls the ready state `Approved`; that instance's process replaced it with a custom `Ready` in the same
 Proposed category (2026-08-11), then added the same `Ready` to Epic and Feature (2026-08-26), which
 stock Scrum does not have at all. Adapting was a `mappings.json` edit and nothing else each time.
 `mappings.sample.json` still ships the stock states for that reason.
@@ -471,9 +471,9 @@ becomes `Migration\IT\Operations`.
 
 | Agility scope | Name | ADO area path |
 |---|---|---|
-| `Scope:1234` | Information Technology | `Migration\IT` |
-| `Scope:2345` | Information Technology OPS | `Migration\IT\Operations` |
-| `Scope:3456` | IT - User Services - Operational | `Migration\IT\User Services` |
+| `Scope:1234` | Parent Program | `Migration\IT` |
+| `Scope:2345` | Parent Program OPS | `Migration\IT\Operations` |
+| `Scope:3456` | Program - User Services | `Migration\IT\User Services` |
 
 All configured scopes migrate in a single run by default. This is deliberate: Epic parents cross
 scope boundaries, and only a whole set run resolves every link. `-Scope` narrows to one configured

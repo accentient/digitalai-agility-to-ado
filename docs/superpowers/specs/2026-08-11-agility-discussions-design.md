@@ -17,7 +17,7 @@ succeeded against an item whose create was backdated first.
 
 ## Measured scope
 
-All figures measured live on 2026-08-11 against the client instance, not estimated.
+All figures measured live on 2026-08-11 against the live instance, not estimated.
 
 | | |
 | --- | ---: |
