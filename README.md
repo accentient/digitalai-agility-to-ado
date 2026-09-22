@@ -20,8 +20,9 @@ It has migrated **53,683 work items in a single run** - all types, all scopes, c
 - Migrates **Epics, Stories, Defects, Tasks, and Issues** through Agility's REST API.
 - Maps work item types, fields, states, and links to their Azure DevOps equivalents, all configurable
   in `mappings.json` without editing the script.
-- Preserves the **hierarchy**, dependency and Affects links, attachments, area and iteration paths,
-  and a **backdated two-point revision history** (created-by and last-changed-by, at their real dates).
+- Preserves the **hierarchy**, dependency and Affects links, attachments, comments, area and
+  iteration paths, and a **backdated two-point revision history** (created-by and last-changed-by, at
+  their real dates).
 - Records each item's Agility number in a custom field, so runs are **idempotent and resumable** -
   an interrupted migration just continues.
 - Validates every mapped state and field against Azure DevOps **before the first create**, so a
@@ -171,70 +172,22 @@ source item's Source value. The source system has no such tags, and every one be
 definition in the project, so they are **off by default**. Set `"WriteTrackingTags": true` in
 `mappings.json` to write them. The source's own tag list is always copied regardless.
 
-## Repairing dependency direction
+## Area paths and iteration paths
 
-Until 2026-09-16 the migration wrote Agility's Dependencies as Successor links and its Dependants as
-Predecessor links, the reverse of what they mean. The migration is fixed; a project migrated before
-that needs its links turned round, and that cannot be done one item at a time because Azure DevOps
-checks the whole graph for cycles on every add. A separate, self-contained script does it in two
-passes over the whole project, with an inventory saved to disk first, a stop check between the
-passes, and a link-by-link verification at the end:
+Azure DevOps rejects an unknown area or iteration path outright (`TF401347`), so both have to exist
+before the migration writes an item to one.
 
-```powershell
-./src/Repair-DependencyDirection.ps1
-```
+**Area paths are handled for you.** `CreateAreaPaths` in `Main` walks your configured scopes, works
+out which nodes the scopes and Themes need, and creates them. Run it before migrating.
 
-`Main` ships with `-DryRun`. It only ever touches `/relations`, never a field, never a work item.
+**Iteration nodes are not.** Each Story, Defect and Task that sits in an Agility Timebox is written
+to `<Project>\<Timebox name>`, and this script never creates those nodes - create them yourself, one
+flat node per distinct Timebox name under the project root, before the migration runs.
 
-## Creating iterations
-
-The migration writes each Story, Defect and Task that sits in an Agility Timebox to the iteration
-path `<Project>\<Timebox name>`, and Azure DevOps rejects an unknown iteration path outright. The
-nodes therefore have to exist before the migration runs, and the migration does not create them. A
-separate, self-contained script does:
-
-```powershell
-./src/Create-Iterations.ps1
-```
-
-It reads every configured scope, collects each distinct Timebox with its start and end dates, and
-creates a flat node under the project root for each one that is missing. It is idempotent: a node
-that already exists is left alone, so it can be run and re-run. Every node is read back afterwards
-to prove the dates landed. `CreateIterations -DryRun` in `Main` lists what a run would add.
-
-Agility's timebox end date is exclusive (it is the day the next sprint starts) while Azure DevOps'
-finish date is inclusive, so each node finishes the day before Agility's end date: a three week
-sprint that starts on a Wednesday finishes on the Tuesday, and the next one starts the following
-Wednesday. `CreateIterations -RepairDates` corrects the dates on nodes that already exist and is the
-only thing in the script that ever updates a node.
-
-## Removing work items
-
-Deleting is a **separate script**, and the separation is deliberate. The migration only ever creates
-and updates; this only ever destroys. Neither script loads, names, or shares a line of code with the
-other, so no edit to one can change what the other does. Tests assert the gap in both directions.
-
-```powershell
-./src/Remove-WorkItems.ps1
-```
-
-```powershell
-# DeleteAllImpediments -DryRun       # count; then drop -DryRun to delete
-# DeleteAllTasks -DryRun
-# DeleteAllBugs -DryRun
-# DeleteAllProductBacklogItems -DryRun
-# DeleteAllFeatures -DryRun
-# DeleteAllEpics -DryRun
-```
-
-Two things to know before you run it:
-
-- **Deletion is permanent.** Items do not go to the recycle bin and cannot be recovered. Always
-  `-DryRun` first; the uncommented line in `Main` ships as a dry run.
-- **Deleting a type orphans its children.** The parent link is written at create time only, so a
-  surviving child is never re-linked to a re-created parent. Delete in reverse dependency order -
-  Impediment, Task, Bug, Product Backlog Item, Feature, Epic - and re-migrate everything below
-  whatever you removed.
+One trap if you script that: Agility's timebox end date is **exclusive** (it is the day the next
+sprint starts) while Azure DevOps' finish date is **inclusive**. Copy the end date verbatim and every
+sprint overlaps its successor by a day. A three week sprint starting on a Wednesday should finish on
+the Tuesday, with the next starting the following Wednesday.
 
 ## Tests
 
@@ -242,9 +195,8 @@ Two things to know before you run it:
 Invoke-Pester -Path tests -Output Detailed
 ```
 
-One test file per script. Both suites are hermetic: nothing resolves a credential, queries a live
-instance, or writes a log file, so they run anywhere. They also run on every push and pull request
-(see the badge above).
+The suite is hermetic: nothing resolves a credential, queries a live instance, or writes a log file,
+so it runs anywhere. It also runs on every push and pull request (see the badge above).
 
 ## Limitations
 
@@ -256,9 +208,11 @@ instance, or writes a log file, so they run anywhere. They also run on every pus
 - Epics nested 3+ deep are flattened onto the top-level Epic, with the real parent kept as a Related
   link.
 - Custom fields must be created in your Azure DevOps process and listed in `mappings.json`.
-- Source comments (Conversations) and full change history are not migrated. History is two-point only
-  - created-by/date and changed-by/date - because Agility's full-history endpoint is not available on
-  every hosted instance. Attachments **are** migrated.
+- Full change history is not migrated. History is two-point only - created-by/date and
+  changed-by/date - because Agility's full-history endpoint is not available on every hosted
+  instance. Attachments and comments **are** migrated.
+- Comments can only be backdated while an item is being created, so they arrive on a full migration
+  or not at all. There is no way to add them to items a previous run already created.
 - Dependency links that form a cycle are rejected by Azure DevOps (`TF201035`). Each is skipped on
   its own, so the work items still migrate; only that one link is lost.
 - Agility descriptions are passed through as HTML without sanitizing.

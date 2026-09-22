@@ -103,14 +103,19 @@ build badge therefore reflects something real. This is the only reason a badge i
 | --- | --- | --- |
 | `README.md:26` | "On the client instance the UI calls..." | generic "one instance we migrated" |
 | `docs/design.md:140` | "On the client instance..." | same |
-| `docs/design.md:629` | "The original example was `.edu conversion`" | generic node name |
+| `docs/design.md:629` | the original example named a client-specific node | generic node name |
 | `mappings.sample.json:275` | `Operations\myClient` | `Operations\Legacy App` |
 | `logs/half-migrated-epic-ids.txt` | tracked in git (161 raw ADO ids) | `git rm --cached`, and `logs/` added to `.gitignore` |
 
-**Tests are deliberately not scrubbed.** `.edu conversion` and `myClient` appear in
-`tests/Migrate-Agility.Tests.ps1` as fixtures pinning two real edge cases - an area path node whose
-name begins with a dot, and an `Exact` remap rule that must beat a more general rule. Renaming them
-for cosmetics would weaken the assertions. They are node names, not client identifiers.
+**Tests were deliberately not scrubbed at the time**, on the reasoning that the two fixtures in
+`tests/Migrate-Agility.Tests.ps1` were node names rather than client identifiers: an area path node
+whose name begins with a dot, and an `Exact` remap rule that must beat a more general rule.
+
+**That reasoning was wrong, and it was reversed on 2026-09-22.** This is a public repository, so a
+node name taken verbatim from a client's instance is a client identifier whatever it pins. Both
+fixtures now use invented names that preserve the property under test - the leading dot and the
+exact-beats-general ordering - so the assertions are unchanged and nothing of the client's is
+published. Scrub the tests too; there is no category of file that gets a pass.
 
 ## Constraints
 
