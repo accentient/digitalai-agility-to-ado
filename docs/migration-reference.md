@@ -94,9 +94,9 @@ knowing before a run puts most of your items there. `-DryRun` prints `state=` pe
 summary counts how many would be removed, so check that number before writing.
 
 **"Most" is not an exaggeration.** On the instance this was built for, `StaleAfterDays = 365` put
-**81% of 53,683 items (43,353) into `Removed`**, leaving 2,561 visible on a backlog. Every portfolio
-item that had finished, finished over a year earlier, so **zero Epics and zero Features ended up
-`Done`** and their Done column reads as empty. That is the rule working, but tell whoever uses the
+**roughly four fifths of some 54,000 items into `Removed`**, leaving only a few thousand visible on a
+backlog. Every portfolio item that had finished, finished over a year earlier, so **zero Epics and
+zero Features ended up `Done`** and their Done column reads as empty. That is the rule working, but tell whoever uses the
 project afterwards, or the first reaction is that the migration lost their work.
 
 ## Acceptance criteria are recovered from the description
@@ -113,7 +113,8 @@ heading with nothing under it writes no field at all.
 
 `Acceptance Criteria` is matched case-insensitively with an optional colon. `AC` is honoured **only
 in heading position** - preceded by a block tag and followed by a colon - because in the measured
-corpus every standalone `AC` in prose was something else entirely ("no MS or `AC` line"). Matching it
+corpus every standalone `AC` in prose was something else entirely ("no PO or `AC` line on the
+invoice"). Matching it
 loosely would be all false positives. The field only exists on Epic, Feature, Product Backlog Item
 and Bug, so Task and Impediment are skipped rather than having the write silently dropped.
 
@@ -156,7 +157,7 @@ path, an ordered rule list in `mappings.json` remaps it onto the tree you actual
 migration never creates nodes outside it (`CreateAreaPaths` applies the same remap). Rules carry
 their own kind - `Exact`, `Prefix` ("this node or below"), or `Contains` - and are evaluated in
 order, first match wins, so a specific exception can be written above a general rule. That ordering
-is load bearing: an exact rule for a `Networking - COVID` node has to sit above a `Contains COVID`
+is load bearing: an exact rule for a `Platform - Legacy` node has to sit above a `Contains Legacy`
 rule, or the general rule swallows it. An unrecognised rule kind throws rather than silently matching
 nothing. This is applied *after* composition rather than by editing `ThemeAreaPaths`, because a
 target can depend on the scope as well as the Theme - the same Theme under two scopes can need two
@@ -165,8 +166,8 @@ different destinations.
 Resolution order is **scope, then Theme, then Team**. The Team is a last resort: it is consulted only
 when an item would otherwise land at the bare project root, which happens when its scope has no area
 path of its own and it carries no Theme. `TeamAreaPaths` is matched **exactly**, never by prefix or
-substring - team names frequently contain node names (a team called `User Services - Sprint` contains
-the node name `User Services`), so a text match looks right and then mis-files the first team named
+substring - team names frequently contain node names (a team called `Support - Sprint` contains
+the node name `Support`), so a text match looks right and then mis-files the first team named
 after something that is not a node. Derive the entries from where each team's work actually lives,
 and leave a team out when the data doesn't say; an unmapped team stays at the root, exactly like an
 unmapped Theme.

@@ -808,7 +808,7 @@ Describe "ResolveAreaPath" {
     $script:mappings = [pscustomobject]@{
       ThemeAreaPaths = [pscustomobject]@{
         "Applications" = "Apps"
-        "Systems"      = "System"
+        "Server Estate" = "Systems"
         "Audio Visual" = "AV"
       }
     }
@@ -819,8 +819,8 @@ Describe "ResolveAreaPath" {
   }
 
   It "translates the theme name, which does not match the ADO node name" {
-    ResolveAreaPath "IT\Operations" "Systems"      | Should -Be "IT\Operations\System"
-    ResolveAreaPath "IT\User Services" "Audio Visual" | Should -Be "IT\User Services\AV"
+    ResolveAreaPath "IT\Operations" "Server Estate" | Should -Be "IT\Operations\Systems"
+    ResolveAreaPath "IT\Support" "Audio Visual" | Should -Be "IT\Support\AV"
   }
 
   It "falls back to the scope's area path when the Story has no Theme" {
@@ -838,8 +838,8 @@ Describe "ResolveAreaPath" {
 # The Team is the LAST resort for an area path, used only when an item would otherwise land at the
 # project root. Measured across all 53,655 items: 122 land at root, and 30 of those carry a Team.
 #
-# The map is EXACT, never a substring or prefix match. "User Services - Sprint" contains the node
-# name "User Services", so a prefix match would look right and then be wrong the moment a team is
+# The map is EXACT, never a substring or prefix match. "Support - Sprint" contains the node
+# name "Support", so a prefix match would look right and then be wrong the moment a team is
 # named after something that is not a node. Each entry below is evidence: every mapped team has
 # 99.8-100% of its work in the scope it maps to.
 ##################################################################################################
@@ -851,12 +851,12 @@ Describe "Team as an area path fallback" {
       TeamAreaPaths  = [pscustomobject]@{
         "IT_Operations"            = "Operations"
         "Operations"               = "Operations"
-        "ITUser Services - Sprint" = "User Services"
-        "User Services - Sprint"   = "User Services"
+        "ITSupport - Sprint" = "Support"
+        "Support - Sprint"   = "Support"
       }
       TeamValueMap = [pscustomobject]@{
         "IT_Operations"            = "Operations"
-        "ITUser Services - Sprint" = "User Services - Sprint"
+        "ITSupport - Sprint" = "Support - Sprint"
       }
     }
   }
@@ -873,8 +873,8 @@ Describe "Team as an area path fallback" {
   # The exact hazard called out: this team's NAME contains a node name, and it must resolve by the
   # map rather than by anything that looks at the text.
   It "maps a team whose name contains a node name, without matching on the text" {
-    ResolveAreaPath "" $null "ITUser Services - Sprint" | Should -Be "User Services"
-    ResolveAreaPath "" $null "User Services - Sprint"   | Should -Be "User Services"
+    ResolveAreaPath "" $null "ITSupport - Sprint" | Should -Be "Support"
+    ResolveAreaPath "" $null "Support - Sprint"   | Should -Be "Support"
   }
 
   It "leaves the item at the root when the team is not in the map" {
@@ -888,12 +888,12 @@ Describe "Team as an area path fallback" {
 
   # The scope is better evidence than the team, so it must never be overridden.
   It "never overrides a scope that already has an area path" {
-    ResolveAreaPath "User Services" $null "IT_Operations" | Should -Be "User Services"
+    ResolveAreaPath "Support" $null "IT_Operations" | Should -Be "Support"
   }
 
   # And the Theme is better evidence still.
   It "never overrides a theme leaf" {
-    ResolveAreaPath "Operations" "Applications" "ITUser Services - Sprint" | Should -Be "Operations\Apps"
+    ResolveAreaPath "Operations" "Applications" "ITSupport - Sprint" | Should -Be "Operations\Apps"
   }
 
   # A themed item in the ROOT scope would otherwise resolve to a bare leaf with no parent node, which
@@ -1329,7 +1329,7 @@ Describe "Agility id and status go to fields, not tags" {
       Priorities = [pscustomobject]@{ DefaultPriority = 2; Map = [pscustomobject]@{} }
       CategoryMap = @(
         [pscustomobject]@{ When = "Contains"; Value = "Operational Plan";     To = "Operational" },
-        [pscustomobject]@{ When = "Contains"; Value = "Colleague";            To = "Operational Enhancement" },
+        [pscustomobject]@{ When = "Contains"; Value = "Ledger";            To = "Operational Enhancement" },
         [pscustomobject]@{ When = "Exact";    Value = "External IT Requests"; To = "External Request" },
         [pscustomobject]@{ When = "Exact";    Value = "Operational";          To = "Operational" }
       )
@@ -2572,7 +2572,7 @@ Describe "Area path creation" {
           name = "Migration"
           children = @(
             [pscustomobject]@{ name = "Operations"; children = @([pscustomobject]@{ name = "Apps" }) }
-            [pscustomobject]@{ name = "User Services" }
+            [pscustomobject]@{ name = "Support" }
           )
         }
       }
@@ -2582,7 +2582,7 @@ Describe "Area path creation" {
       $paths.Count | Should -Be 3
       $paths.ContainsKey("operations") | Should -BeTrue
       $paths.ContainsKey("operations\apps") | Should -BeTrue
-      $paths.ContainsKey("user services") | Should -BeTrue
+      $paths.ContainsKey("support") | Should -BeTrue
       $paths.ContainsKey("migration") | Should -BeFalse -Because "the project root is not part of the configured path"
     }
 
@@ -2630,9 +2630,9 @@ Describe "Area path creation" {
         return [pscustomobject]@{ id = 1 }
       }
 
-      EnsureAreaPath "Operations\Colleague" $have
+      EnsureAreaPath "Operations\Ledger" $have
 
-      $script:posted[0].Name | Should -Be "Colleague"
+      $script:posted[0].Name | Should -Be "Ledger"
       $script:posted[0].Url | Should -BeLike "*/classificationnodes/areas/Operations?*"
       $script:created | Should -Be 1
     }
@@ -3214,9 +3214,9 @@ Describe "Issue blocking links" {
 # Category and area path both became ORDERED RULE LISTS on 2026-08-05, because the user's rules are
 # not expressible as the flat name-to-name maps the rest of the file uses:
 #
-#   "everything EDU and below"  is a prefix rule
-#   "any COVID"                 is a contains rule
-#   "Networking - COVID"        is an EXACT rule that must beat the contains rule above
+#   "everything ARC and below"  is a prefix rule
+#   "any Legacy"                 is a contains rule
+#   "Platform - Legacy"        is an EXACT rule that must beat the contains rule above
 #
 # Order is therefore load bearing, and the exception has to come before the general case. Every rule
 # kind is spelled out per rule (Exact / Prefix / Contains) rather than inferred, and an unrecognised
@@ -3335,7 +3335,7 @@ Describe "Category mapping and the description note" {
       RequiredFields = [pscustomobject]@{ AgilityCategory = "Custom.DigitalAICategory" }
       CategoryMap = @(
         [pscustomobject]@{ When = "Contains"; Value = "Operational Plan";     To = "Operational" },
-        [pscustomobject]@{ When = "Contains"; Value = "Colleague";            To = "Operational Enhancement" },
+        [pscustomobject]@{ When = "Contains"; Value = "Ledger";            To = "Operational Enhancement" },
         [pscustomobject]@{ When = "Exact";    Value = "External IT Requests"; To = "External Request" },
         [pscustomobject]@{ When = "Exact";    Value = "External Request";     To = "External Request" },
         [pscustomobject]@{ When = "Exact";    Value = "Operational";          To = "Operational" }
@@ -3359,8 +3359,8 @@ Describe "Category mapping and the description note" {
       @('operational plan',                 'Operational'),
       @('OPERATIONAL PLAN',                 'Operational'),
       @('Operational',                      'Operational'),
-      @('Colleague Integration - Internal', 'Operational Enhancement'),
-      @('Colleague Integration - Vendor',   'Operational Enhancement'),
+      @('Ledger Integration - Internal', 'Operational Enhancement'),
+      @('Ledger Integration - Vendor',   'Operational Enhancement'),
       @('External IT Requests',             'External Request'),
       @('External Request',                 'External Request')
     )
@@ -3469,21 +3469,21 @@ Describe "Area path remapping onto the fixed IT tree" {
 
   BeforeAll {
     $script:mappings = [pscustomobject]@{
-      ThemeAreaPaths = [pscustomobject]@{ Colleague = "Colleague"; AV = "AV" }
+      ThemeAreaPaths = [pscustomobject]@{ Ledger = "Ledger"; AV = "AV" }
       AreaPathRemap = @(
-        [pscustomobject]@{ When = "Prefix";   Value = "EDU";                                  To = "" },
-        [pscustomobject]@{ When = "Exact";    Value = "Operations\Networking - COVID";         To = "Operations\Networking" },
-        [pscustomobject]@{ When = "Contains"; Value = "COVID";                                 To = "" },
-        [pscustomobject]@{ When = "Exact";    Value = "Operations\Blackboard";                 To = "Operations\Apps" },
-        [pscustomobject]@{ When = "Exact";    Value = "Operations\Colleague";                  To = "Operations\Apps" },
+        [pscustomobject]@{ When = "Prefix";   Value = "ARC";                                  To = "" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operations\Platform - Legacy";         To = "Operations\Platform" },
+        [pscustomobject]@{ When = "Contains"; Value = "Legacy";                                 To = "" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operations\Portal";                 To = "Operations\Apps" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operations\Ledger";                  To = "Operations\Apps" },
         [pscustomobject]@{ When = "Exact";    Value = "Operations\myClient";                      To = "Operations\Apps" },
         [pscustomobject]@{ When = "Exact";    Value = "Operations\Security";                   To = "Operations\Apps" },
         [pscustomobject]@{ When = "Exact";    Value = "Operations\Databases";                  To = "Operations\DevOps" },
         [pscustomobject]@{ When = "Exact";    Value = "Operations\Infrastructure";             To = "Operations\DevOps" },
-        [pscustomobject]@{ When = "Exact";    Value = "Operations\IT OPS";                     To = "Operations" },
-        [pscustomobject]@{ When = "Exact";    Value = "Operations\IT User Services";           To = "User Services" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operations\Ops Group";                     To = "Operations" },
+        [pscustomobject]@{ When = "Exact";    Value = "Operations\Support Group";           To = "Support" },
         [pscustomobject]@{ When = "Exact";    Value = "Operations\Other";                      To = "Operations" },
-        [pscustomobject]@{ When = "Exact";    Value = "User Services\Audio Visual - CARES Act"; To = "User Services\AV" }
+        [pscustomobject]@{ When = "Exact";    Value = "Support\Audio Visual - Grant Program"; To = "Support\AV" }
       )
     }
   }
@@ -3493,34 +3493,34 @@ Describe "Area path remapping onto the fixed IT tree" {
   It "sends all 29 live area paths to the right node" {
     $expected = @{
       ''                                          = ''
-      'EDU'                                       = ''
-      'EDU\Apps'                                  = ''
-      'EDU\Colleague'                             = ''
-      'EDU\Databases'                             = ''
-      'EDU\Infrastructure'                        = ''
-      'EDU\myClient'                                 = ''
-      'EDU\Networking'                            = ''
-      'EDU\Other'                                 = ''
-      'EDU\System'                                = ''
+      'ARC'                                       = ''
+      'ARC\Apps'                                  = ''
+      'ARC\Ledger'                             = ''
+      'ARC\Databases'                             = ''
+      'ARC\Infrastructure'                        = ''
+      'ARC\myClient'                                 = ''
+      'ARC\Platform'                            = ''
+      'ARC\Other'                                 = ''
+      'ARC\System'                                = ''
       'Operations'                                = 'Operations'
       'Operations\Apps'                           = 'Operations\Apps'
-      'Operations\Blackboard'                     = 'Operations\Apps'
-      'Operations\Colleague'                      = 'Operations\Apps'
+      'Operations\Portal'                     = 'Operations\Apps'
+      'Operations\Ledger'                      = 'Operations\Apps'
       'Operations\Databases'                      = 'Operations\DevOps'
       'Operations\Infrastructure'                 = 'Operations\DevOps'
-      'Operations\IT OPS'                         = 'Operations'
-      'Operations\IT User Services'               = 'User Services'
+      'Operations\Ops Group'                         = 'Operations'
+      'Operations\Support Group'               = 'Support'
       'Operations\myClient'                          = 'Operations\Apps'
-      'Operations\Networking'                     = 'Operations\Networking'
-      'Operations\Networking - COVID'             = 'Operations\Networking'
+      'Operations\Platform'                     = 'Operations\Platform'
+      'Operations\Platform - Legacy'             = 'Operations\Platform'
       'Operations\Other'                          = 'Operations'
       'Operations\Security'                       = 'Operations\Apps'
-      'Operations\System'                         = 'Operations\System'
-      'User Services'                             = 'User Services'
-      'User Services\Audio Visual - CARES Act'    = 'User Services\AV'
-      'User Services\AV'                          = 'User Services\AV'
-      'User Services\COVID-19 Grants'             = ''
-      'User Services\COVID-19 Response'           = ''
+      'Operations\Systems'                        = 'Operations\Systems'
+      'Support'                             = 'Support'
+      'Support\Audio Visual - Grant Program'    = 'Support\AV'
+      'Support\AV'                          = 'Support\AV'
+      'Support\Legacy-19 Grants'             = ''
+      'Support\Legacy-19 Response'           = ''
     }
 
     foreach ($from in $expected.Keys)
@@ -3529,18 +3529,18 @@ Describe "Area path remapping onto the fixed IT tree" {
     }
   }
 
-  # The one place order decides the answer. Networking - COVID contains COVID, and the generic COVID
+  # The one place order decides the answer. Platform - Legacy contains Legacy, and the generic Legacy
   # rule sends things to the root, so the exact rule has to be evaluated first.
-  It "keeps Networking - COVID out of the generic COVID rule" {
-    RemapAreaPath 'Operations\Networking - COVID' | Should -Be 'Operations\Networking'
-    RemapAreaPath 'User Services\COVID-19 Grants' | Should -Be ''
+  It "keeps Platform - Legacy out of the generic Legacy rule" {
+    RemapAreaPath 'Operations\Platform - Legacy' | Should -Be 'Operations\Platform'
+    RemapAreaPath 'Support\Legacy-19 Grants' | Should -Be ''
   }
 
   # Prefix must mean "this node or below", not "starts with these letters".
-  It "does not treat a longer name as being under EDU" {
-    RemapAreaPath 'EDUCATION'       | Should -Be 'EDUCATION'
-    RemapAreaPath 'EDU'             | Should -Be ''
-    RemapAreaPath 'EDU\Anything'    | Should -Be ''
+  It "does not treat a longer name as being under ARC" {
+    RemapAreaPath 'ARCHIVE'       | Should -Be 'ARCHIVE'
+    RemapAreaPath 'ARC'             | Should -Be ''
+    RemapAreaPath 'ARC\Anything'    | Should -Be ''
   }
 
   It "leaves a path no rule matches untouched" {
@@ -3551,9 +3551,9 @@ Describe "Area path remapping onto the fixed IT tree" {
   # ResolveAreaPath composes scope + theme and THEN remaps, so the rules are written against the
   # tree as it exists rather than against every scope/theme combination.
   It "applies the remap to what ResolveAreaPath composes" {
-    ResolveAreaPath 'Operations' 'Colleague' $null | Should -Be 'Operations\Apps'
-    ResolveAreaPath 'EDU' 'Colleague' $null        | Should -Be ''
-    ResolveAreaPath 'User Services' 'AV' $null     | Should -Be 'User Services\AV'
+    ResolveAreaPath 'Operations' 'Ledger' $null | Should -Be 'Operations\Apps'
+    ResolveAreaPath 'ARC' 'Ledger' $null        | Should -Be ''
+    ResolveAreaPath 'Support' 'AV' $null     | Should -Be 'Support\AV'
   }
 
   # A rule kind nobody implemented must stop the run, not quietly match nothing.

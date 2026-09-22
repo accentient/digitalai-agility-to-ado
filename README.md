@@ -9,7 +9,8 @@ A PowerShell tool that migrates work items one way, from [Digital.ai Agility](ht
 It reads from Agility and creates work items in an Azure DevOps project, preserving hierarchy, links,
 attachments, history, and traceability.
 
-It has migrated **53,683 work items in a single run** - all types, all scopes, closed items included.
+It has migrated **over 50,000 work items in a single run** - all types, all scopes, closed items
+included.
 
 > **Agility is only ever read from.** Every Agility call goes through a single function that hard
 > codes `-Method Get`, so the tool has no code path that can modify anything in the source. Tests

@@ -7,41 +7,41 @@ holds the current operational state; this file is the design reasoning behind it
 
 ## Migration log
 
-**COMPLETE (2026-08-05/06). All five types, all five scopes, closed items included: 53,683 work
-items** created by ONE `Migrate` call into an empty project, **0 skipped, 0 failed, in 13h 50m** -
-342 Epics, 535 Features, 7,702 Product Backlog Items, 712 Bugs, 43,999 Tasks, 393 Impediments. Every
+**COMPLETE (2026-08-05/06). All five types, all five scopes, closed items included: roughly 54,000
+work items** created by ONE `Migrate` call into an empty project, **0 skipped, 0 failed, in 13h 50m**
+- a few hundred Epics and Features, several thousand Product Backlog Items, several hundred Bugs,
+tens of thousands of Tasks, a few hundred Impediments. Every
 item carries the `Custom.DigitalAI*` fields, a backdated two-point history (created-by / changed-by),
 area and iteration paths, and links (parent, Affects, Related, Successor/Predecessor). Close dates
 are real historical values; no Dead template Epics leaked in.
 
 **A full relationship audit after the run** compared every link against Agility, using the
 migration's own parser and `ResolveEpicHierarchy` so the expectation was what the migration should
-have produced: 49,474 parent links with **0 wrong**, **0 same-category parent links**, 533 Affects,
-390 Related pairs (334 flattened-Epic true parents + 56 Challenge relates-to), 8,696 of 8,706
-dependency ends, and **0 dangling** out of 109,488 link targets checked. The 10 missing dependency
+have produced: every parent link correct with **0 wrong**, **0 same-category parent links**, and **0 dangling** out
+of more than a hundred thousand link targets checked, with all but ten dependency ends present. The 10 missing dependency
 ends are 5 cyclic pairs ADO refuses (`TF201035`) - Agility permits cycles, ADO does not. Also
-verified: 43,353 `Removed`, 3,114 attachments with 0 failures.
+verified: the `Removed` total matched the log, and every attachment copied with 0 failures.
 
 **The state distribution was measured separately (2026-08-11)**, because the run log records only the
-`Removed` total and never the per-type split. Reading all 53,683 items back: Epic 26 New / 1 In
-Progress / 315 Removed; Feature 66 / 8 / 461; PBI 343 New, 6 Approved, 37 In Progress, 1,062 Done,
-6,254 Removed; Bug 1 / 2 / 3 / 107 / 599; Task 1,911 To Do, 109 In Progress, 6,255 Done, 35,724
-Removed; Impediment 48 Open, 345 Closed. The Removed column sums to exactly 43,353 and the table to
-53,683, which is the check that the scan and the log agree. **0 Epics and 0 Features are `Done`** -
+`Removed` total and never the per-type split. Reading every item back: for each type the great majority
+sat in `Removed`, with only a small tail in New, In Progress and Done, and Impediment split a few
+dozen Open against a few hundred Closed. The Removed column summed to exactly the run log's own
+counter and the table to the project total, which is the check that the scan and the log agree. **0 Epics and 0 Features are `Done`** -
 the stale rule archived every portfolio item that finished, so an empty Done column is correct.
-**Only 2,561 items are live**, which is the number that matters to anyone opening a backlog.
+**Only a few thousand items are live**, which is the number that matters to anyone opening a
+backlog.
 
-Field coverage from the same scan: `AssignedTo` 40,201, `ClosedBy` 30,331, `AcceptanceCriteria`
-6,574, and 32,345 items on a real iteration. Tag census: 2 `agility-depends`, 116 `agility-source`,
-2,286 Agility `TaggedWith`, and zero `agility-parent`, `agility-blocks` or `agility-relates`.
+Field coverage from the same scan: `AssignedTo` on about three quarters of items, `ClosedBy` on
+rather more than half, `AcceptanceCriteria` on a few thousand, and most items on a real iteration. Tag census: a couple of `agility-depends`, a hundred or so
+`agility-source`, a few thousand Agility `TaggedWith`, and zero `agility-parent`, `agility-blocks` or `agility-relates`.
 
 Re-running such a scan has one trap worth writing down: **`$top` belongs on the WIQL query string,
-not in the JSON body**. Without it a flat `SELECT` over 53,683 rows fails outright with `VS402337`
+not in the JSON body**. Without it a flat `SELECT` over tens of thousands of rows fails outright with `VS402337`
 rather than truncating. Page on a `System.Id` watermark, then read fields with
 `POST _apis/wit/workitemsbatch` in batches of 200 and tally on the client - long-text fields such as
 `AcceptanceCriteria` come back that way but cannot be filtered in WIQL at all.
 
-This replaced a 53,705-item run (2026-08-04) and, before that, a 53,450-item run (2026-07-18). Four
+This replaced two earlier full runs of comparable size (2026-08-04 and 2026-07-18). Four
 failure modes were found and fixed across them, each documented where its reasoning lives:
 `TF401320 Closed Date Required` (see [Close dates](#close-dates)), `TF401320 Closed By ReadOnly`
 (identity fields are read-only under process rules, so `ClosedBy` rides in the bypassRules create),
@@ -433,8 +433,8 @@ TF401320: Rule Error for field Closed Date. Error code: Required, ReadOnly, SetB
 SetByDefaultRule, InvalidEmpty.
 ```
 
-**Only Task's `Done` state *requires* a Closed Date**, so only Tasks failed - all 30,928 closed ones
-in the first full run. Story/Defect/Issue/Epic allow an empty Closed Date and came through clean.
+**Only Task's `Done` state *requires* a Closed Date**, so only Tasks failed - every closed one of them
+in the first full run, tens of thousands of items. Story/Defect/Issue/Epic allow an empty Closed Date and came through clean.
 Proven on throwaways: a bypass transition to Done with an empty Closed Date, followed by any
 rule-checked patch, fails; with the Closed Date set in the transition, it passes.
 
@@ -473,7 +473,7 @@ becomes `Migration\IT\Operations`.
 |---|---|---|
 | `Scope:1234` | Parent Program | `Migration\IT` |
 | `Scope:2345` | Parent Program OPS | `Migration\IT\Operations` |
-| `Scope:3456` | Program - User Services | `Migration\IT\User Services` |
+| `Scope:3456` | Program - Support | `Migration\IT\Support` |
 
 All configured scopes migrate in a single run by default. This is deliberate: Epic parents cross
 scope boundaries, and only a whole set run resolves every link. `-Scope` narrows to one configured
@@ -592,9 +592,9 @@ The Themes in use map onto the area paths already created in ADO:
 | Agility Theme | Open stories | ADO area path |
 |---|---|---|
 | Applications | 160 | `Migration\IT\Operations\Apps` |
-| Systems | 96 | `Migration\IT\Operations\System` |
-| Networking | 32 | `Migration\IT\Operations\Networking` |
-| Audio Visual | 17 | `Migration\IT\User Services\AV` |
+| Systems | 96 | `Migration\IT\Operations\Systems` |
+| Platform | 32 | `Migration\IT\Operations\Platform` |
+| Audio Visual | 17 | `Migration\IT\Support\AV` |
 
 So the deeper area paths, which the Epic migration never fills, are for Stories, mapped from Theme.
 
@@ -603,7 +603,7 @@ all scopes have no Theme at all. Theme to area path needs a fallback to the scop
 and the Theme name does not match the area node name exactly (Applications vs Apps, Systems vs
 System), so it needs a map in `mappings.json` rather than a string match.
 
-`DevOps`, `Help Desk`, and `Technical Services Support` have no matching Theme, so they stay empty
+`DevOps`, `Help Desk`, and `Field Services` have no matching Theme, so they stay empty
 unless populated another way.
 
 ## Finding what is already migrated
@@ -658,8 +658,8 @@ The Story knows its own Epic's Number, so nothing needs loading: `Super` gives t
 `Super.Number` gives `E-01330`. `MigrateWorkitems` bridges the two before migrating, which makes
 `ResolveMigratedId` work unchanged and the dry run print the real parent instead of a blank.
 
-This matters at scale: **4,526 of 7,568 Stories and 323 of 704 Defects have a Super**, so roughly
-4,849 parent links were at stake.
+This matters at scale: **most Stories and roughly half the Defects have a Super**, so several thousand
+parent links were at stake.
 
 ## Parents outside the configured scopes
 
@@ -682,8 +682,8 @@ resolved". It did not mean that. The number came from `numberByOid`, but the **l
 `ResolveMigratedId`, which returns null for an Epic that was never migrated. The two were never the
 same thing, and the output showed the one that always succeeds.
 
-That is how "4,525 parents resolved" got reported when the real figure was 4,501 links and 24
-unparented items. A dry run that overstates what a real run will do is worse than one that stays
+That is how a "parents resolved" count got reported that was a couple of dozen higher than the links
+actually written. A dry run that overstates what a real run will do is worse than one that stays
 quiet, because it is trusted. It now prints the actual outcome:
 
 ```

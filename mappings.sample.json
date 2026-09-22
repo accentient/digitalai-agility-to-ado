@@ -120,18 +120,18 @@
     "UnmigratedBlocked": "agility-blocks",
     "Source": "agility-source"
   },
-  "_comment_TeamAreaPaths": "OPTIONAL, EXAMPLES - replace with your org's teams. LAST RESORT for an area path, used only when an item would otherwise land at the PROJECT ROOT, i.e. when its scope has no area path of its own and it has no Theme. Order of evidence: scope, then Theme, then Team. The match is EXACT and must stay that way: team names often CONTAIN node names ('User Services - Sprint' contains 'User Services'), so a prefix or substring test would look correct and then mis-file the first team named after something that is not a node. Both the raw source team name and the cleaned name from TeamValueMap resolve, so an entry written from either system works. Derive entries from evidence - check where each team's work actually lives - and leave a team OUT when the data does not say; an unmapped team stays at the root, exactly as an unmapped Theme does. Run CreateAreaPaths after adding a target that is not already a scope's area path.",
+  "_comment_TeamAreaPaths": "OPTIONAL, EXAMPLES - replace with your org's teams. LAST RESORT for an area path, used only when an item would otherwise land at the PROJECT ROOT, i.e. when its scope has no area path of its own and it has no Theme. Order of evidence: scope, then Theme, then Team. The match is EXACT and must stay that way: team names often CONTAIN node names ('Support - Sprint' contains 'Support'), so a prefix or substring test would look correct and then mis-file the first team named after something that is not a node. Both the raw source team name and the cleaned name from TeamValueMap resolve, so an entry written from either system works. Derive entries from evidence - check where each team's work actually lives - and leave a team OUT when the data does not say; an unmapped team stays at the root, exactly as an unmapped Theme does. Run CreateAreaPaths after adding a target that is not already a scope's area path.",
   "TeamAreaPaths": {
     "Ops_Team": "Operations",
     "Operations": "Operations",
-    "Support_Team - Sprint": "User Services",
-    "User Services - Sprint": "User Services"
+    "Svc_Team - Sprint": "Support",
+    "Support - Sprint": "Support"
   },
   "_comment_ThemeAreaPaths": "EXAMPLES - replace with your org's Themes. A Story's/Defect's Theme supplies the area path leaf under the scope's area path (Theme name -> ADO node name, which may differ). A Theme with no entry, or an item with no Theme, falls back to the scope's own area path (or to the Team, see TeamAreaPaths). List every Theme carrying a Story or Defect across all scopes. ADO rejects an unknown area path (TF401347), so run CreateAreaPaths after editing.",
   "ThemeAreaPaths": {
     "Applications": "Apps",
     "Databases": "Databases",
-    "Networking": "Networking"
+    "Platform": "Platform"
   },
   "_comment_StaleAfterDays": "OPTIONAL. Work that finished more than this many days before the run starts is created in its type's StaleState instead of its ClosedState, so long-finished work is archived rather than shown as Done. Age comes from the source ClosedDate, falling back to ChangeDate then CreateDate; an item with no date at all is never treated as stale. The cutoff is resolved ONCE per run so every item is measured against the same instant. Omit this key, or set it to zero or less, to turn the rule off. Note that ADO hides Removed items from backlogs, boards, and default queries.",
   "StaleAfterDays": 365,
@@ -229,7 +229,7 @@
     },
     {
       "When": "Contains",
-      "Value": "Colleague",
+      "Value": "Ledger",
       "To": "Operational Enhancement"
     },
     {
@@ -248,36 +248,36 @@
       "To": "Operational"
     }
   ],
-  "_comment_AreaPathRemap": "ORDERED rules, first match wins, applied by RemapAreaPath to the path ResolveAreaPath composes from scope and Theme. Folds the migrated tree onto the fixed target: Operations{Apps,DevOps,Networking,System} and User Services{AV,Help Desk,Technical Services Support}. Applied after composition, not by rewriting ThemeAreaPaths, because the target depends on the scope too - Colleague under Operations becomes Apps, Colleague under EDU goes to the root. ORDER IS LOAD BEARING: the Exact rule for the Networking - COVID node sits ABOVE the Contains rule for COVID, or the generic rule would send it to the root. Prefix means 'this node or below', so EDU never swallows EDUCATION. A path no rule matches is left unchanged.",
+  "_comment_AreaPathRemap": "ORDERED rules, first match wins, applied by RemapAreaPath to the path ResolveAreaPath composes from scope and Theme. Folds the migrated tree onto the fixed target: Operations{Apps,DevOps,Platform,Systems} and Support{AV,Help Desk,Field Services}. Applied after composition, not by rewriting ThemeAreaPaths, because the target depends on the scope too - Ledger under Operations becomes Apps, Ledger under ARC goes to the root. ORDER IS LOAD BEARING: the Exact rule for the Platform - Legacy node sits ABOVE the Contains rule for Legacy, or the generic rule would send it to the root. Prefix means 'this node or below', so ARC never swallows ARCHIVE. A path no rule matches is left unchanged.",
   "AreaPathRemap": [
     {
       "When": "Prefix",
-      "Value": "EDU",
+      "Value": "ARC",
       "To": ""
     },
     {
       "When": "Exact",
-      "Value": "Operations\\Networking - COVID",
-      "To": "Operations\\Networking"
+      "Value": "Operations\\Platform - Legacy",
+      "To": "Operations\\Platform"
     },
     {
       "When": "Contains",
-      "Value": "COVID",
+      "Value": "Legacy",
       "To": ""
     },
     {
       "When": "Exact",
-      "Value": "Operations\\Blackboard",
+      "Value": "Operations\\Portal",
       "To": "Operations\\Apps"
     },
     {
       "When": "Exact",
-      "Value": "Operations\\Colleague",
+      "Value": "Operations\\Ledger",
       "To": "Operations\\Apps"
     },
     {
       "When": "Exact",
-      "Value": "Operations\\Legacy App",
+      "Value": "Operations\\Vendor App",
       "To": "Operations\\Apps"
     },
     {
@@ -297,13 +297,13 @@
     },
     {
       "When": "Exact",
-      "Value": "Operations\\IT OPS",
+      "Value": "Operations\\Ops Group",
       "To": "Operations"
     },
     {
       "When": "Exact",
-      "Value": "Operations\\IT User Services",
-      "To": "User Services"
+      "Value": "Operations\\Support Group",
+      "To": "Support"
     },
     {
       "When": "Exact",
@@ -312,8 +312,8 @@
     },
     {
       "When": "Exact",
-      "Value": "User Services\\Audio Visual - CARES Act",
-      "To": "User Services\\AV"
+      "Value": "Support\\Audio Visual - Grant Program",
+      "To": "Support\\AV"
     }
   ]
 }

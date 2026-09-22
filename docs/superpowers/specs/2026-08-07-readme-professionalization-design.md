@@ -56,7 +56,7 @@ so this surface is unchanged at least back to 18.x and carries no deprecation no
 Do not publish a version list that implies testing that did not happen. The lineage table exists for
 discoverability (people search "VersionOne migration"), and every row is labelled with its evidence.
 
-Target side: **Azure DevOps Services, Scrum process - verified** (53,683 items). Azure DevOps Server
+Target side: **Azure DevOps Services, Scrum process - verified** (over 50,000 items). Azure DevOps Server
 is untested. The Agile process needs `mappings.json` changes (User Story, StoryPoints).
 
 ## Deliverables
@@ -104,7 +104,7 @@ build badge therefore reflects something real. This is the only reason a badge i
 | `README.md:26` | "On the client instance the UI calls..." | generic "one instance we migrated" |
 | `docs/design.md:140` | "On the client instance..." | same |
 | `docs/design.md:629` | the original example named a client-specific node | generic node name |
-| `mappings.sample.json:275` | `Operations\myClient` | `Operations\Legacy App` |
+| `mappings.sample.json:275` | `Operations\myClient` | `Operations\Vendor App` |
 | `logs/half-migrated-epic-ids.txt` | tracked in git (161 raw ADO ids) | `git rm --cached`, and `logs/` added to `.gitignore` |
 
 **Tests were deliberately not scrubbed at the time**, on the reasoning that the two fixtures in

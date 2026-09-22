@@ -25,7 +25,7 @@ All figures measured live on 2026-08-11 against the live instance, not estimated
 | `Conversation` assets | 24,971 |
 | Conversations touching a migrated work item | 8,488 |
 | **Comments this feature writes** | **15,228** |
-| **Work items receiving a discussion** | **5,654** (10.5% of 53,683) |
+| **Work items receiving a discussion** | **~5,700** (about 10% of the project) |
 | Longest thread on a single item | 37 |
 | Distinct comment authors | 125 |
 | Expressions with no author | 3 |

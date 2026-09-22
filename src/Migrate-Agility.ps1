@@ -76,7 +76,7 @@ function Main
   # Migrate -Types Story,Defect,Issue                     # 8,673 items
   # Migrate -DryRun -Types Task -Scope "Scope:3456"       # one scope
   # Migrate -Types Task                                   # 43,436 Tasks on their own
-  # Migrate -DryRun -Scope "Scope:5678"                  # the EDU scope, 466 items
+  # Migrate -DryRun -Scope "Scope:5678"                  # the ARC scope, 466 items
   # Migrate -DryRun                                       # all five types, ~52,000 items
   # Migrate                                               # the whole migration
 
@@ -259,7 +259,7 @@ function CreateAreaPaths([switch]$DryRun)
     # The scope's own node first: a Theme leaf cannot hang off a parent that does not exist.
     #
     # Remapped, like every other path here. Without it this would recreate the pre-remap tree - the
-    # EDU node, and every Theme leaf that AreaPathRemap folds away - which is the opposite of the
+    # ARC node, and every Theme leaf that AreaPathRemap folds away - which is the opposite of the
     # point: the target tree is fixed and the migration must not add to it.
     EnsureAreaPath (RemapAreaPath $s.AreaPath) $have
 
@@ -2260,8 +2260,8 @@ function BuildOwnersField($item)
 
 # ORDERED rule matching, shared by the category map and the area path remap.
 #
-# Both were asked for in terms a flat name-to-name map cannot express: "everything EDU and below" is
-# a prefix, "any COVID" is a substring, and "Networking - COVID" is an exact exception that has to
+# Both were asked for in terms a flat name-to-name map cannot express: "everything ARC and below" is
+# a prefix, "any Legacy" is a substring, and "Platform - Legacy" is an exact exception that has to
 # beat that substring. So the rules are a LIST, evaluated in order, first match wins, and the
 # exception is written above the general case.
 #
@@ -2282,7 +2282,7 @@ function MatchesValueRule($rule, [string]$value)
     'Exact'    { return $v.Equals($target, [StringComparison]::OrdinalIgnoreCase) }
     'Contains' { return ($v.IndexOf($target, [StringComparison]::OrdinalIgnoreCase) -ge 0) }
 
-    # "This node or below", never "starts with these letters": EDU must not swallow EDUCATION.
+    # "This node or below", never "starts with these letters": ARC must not swallow ARCHIVE.
     'Prefix'
     {
       if ($v.Equals($target, [StringComparison]::OrdinalIgnoreCase)) { return $true }
@@ -4011,15 +4011,15 @@ function ResolveAreaPath([string]$scopeAreaPath, [string]$theme, [string]$team)
 
 # The composed scope-and-Theme path folded onto the fixed IT tree the migration targets:
 #
-#   Operations{Apps, DevOps, Networking, System}   User Services{AV, Help Desk, Technical Services Support}
+#   Operations{Apps, DevOps, Platform, System}   Support{AV, Help Desk, Field Services}
 #
 # Applied AFTER composition rather than by rewriting ThemeAreaPaths, because the target depends on
-# the scope as well as the Theme: Colleague under Operations becomes Apps, but Colleague under EDU
+# the scope as well as the Theme: Ledger under Operations becomes Apps, but Ledger under ARC
 # goes to the root. A per-Theme map cannot express that; a rule over the composed path can.
 #
 # Rules live in mappings.json and are ORDERED - see MatchesValueRule. The order that matters:
-# "Operations\Networking - COVID" is an Exact rule ABOVE the Contains rule for COVID, or the generic
-# rule would send it to the root instead of to Networking.
+# "Operations\Platform - Legacy" is an Exact rule ABOVE the Contains rule for Legacy, or the generic
+# rule would send it to the root instead of to Platform.
 #
 # A path no rule matches is returned unchanged, so a Theme added later lands where it always would
 # have rather than silently at the root.
@@ -4040,8 +4040,8 @@ function RemapAreaPath([string]$path)
 # Information Technology root) has no area path of its own, so its items had nowhere to go; the Team
 # says which part of IT actually owns the work.
 #
-# The match is EXACT, and that is the whole point. Team names contain node names - "User Services -
-# Sprint" contains "User Services" - so any prefix, substring or startswith test would look correct
+# The match is EXACT, and that is the whole point. Team names contain node names - "Support -
+# Sprint" contains "Support" - so any prefix, substring or startswith test would look correct
 # and then silently mis-file the first team that is named after something which is not a node. An
 # unmapped team is left at the root, exactly as an unmapped Theme is.
 #
